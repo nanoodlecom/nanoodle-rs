@@ -59,6 +59,14 @@ Execution semantics worth knowing:
   defaults (exceptions: model3d defaults to Tripo, cleanvoice has a
   default model).
 
+### Conditional Decide
+
+Use the `decide-branch` type to select a Yes or No route. The active port forwards the
+input text or, without text, the answer. Inactive routes skip without provider charges,
+joins receive active inputs, and an invalid decision opens neither route. Existing
+`decide` gates keep their previous behavior. The shared graph in
+`tests/fixtures/decider-branches.json` runs in the offline integration test.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

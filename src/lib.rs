@@ -271,7 +271,12 @@ pub fn materialize(data: &Value) -> Result<Graph> {
                 id
             )));
         }
-        let ty = if ty == "audio" { "tts".to_string() } else { ty };
+        let branching = ty == "decide-branch";
+        let ty = match ty.as_str() {
+            "audio" => "tts".into(),
+            "decide-branch" => "decide".into(),
+            _ => ty,
+        };
         let mut n = Node {
             id,
             name: raw.get("name").and_then(|v| v.as_str()).map(|s| s.to_string()),
@@ -279,6 +284,9 @@ pub fn materialize(data: &Value) -> Result<Graph> {
             unknown: false,
             ty,
         };
+        if branching {
+            n.fields.insert("branch".into(), Value::Bool(true));
+        }
         if node_type(&n.ty).is_none() {
             n.unknown = true;
             warnings.push(format!(
@@ -828,6 +836,10 @@ fn decide_lines(s: &str) -> Vec<String> {
     s.split('\n').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect()
 }
 
+fn branch_decider(node: &Node) -> bool {
+    node.ty == "decide" && node.fields.get("branch").and_then(Value::as_bool) == Some(true)
+}
+
 fn run_decide(
     node: &Node,
     inputs: &HashMap<String, Value>,
@@ -835,9 +847,14 @@ fn run_decide(
 ) -> std::result::Result<NodeOutcome, NodeError> {
     let f = &node.fields;
     let mode_raw = node.field_str("mode").unwrap_or_default();
-    let mode = match mode_raw.as_str() {
-        "choose" | "score" | "yesno" => mode_raw.as_str(),
-        _ => "pick",
+    let branching = branch_decider(node);
+    let mode = if branching {
+        "yesno"
+    } else {
+        match mode_raw.as_str() {
+            "choose" | "score" | "yesno" => mode_raw.as_str(),
+            _ => "pick",
+        }
     };
     let text = input_text(inputs, "text").unwrap_or_default().trim().to_string();
     let imgs = collect_img_ports(inputs);
@@ -1034,6 +1051,24 @@ fn run_decide(
         }
         _ => {
             let (j, c) = send(state_for(&sent))?;
+            if branching {
+                let answer = j.pointer("/answers/answer").unwrap_or(&Value::Null);
+                let probability = answer.get("noul").and_then(Value::as_f64)
+                    .filter(|p| (0.0..=1.0).contains(p));
+                let Some(yes) = probability.filter(|_| answer.get("type").and_then(Value::as_str) == Some("noul")) else {
+                    return Err(NodeError {
+                        message: "Decide needs a valid yes/no answer to select a branch".into(),
+                        cost: c,
+                    });
+                };
+                let branch = if yes >= 0.5 { "yes" } else { "no" };
+                let mut out = Map::new();
+                out.insert("text".into(), json!(branch));
+                out.insert("image".into(), json!(imgs.first().cloned().unwrap_or_default()));
+                out.insert("decision".into(), json!({ "branch": branch, "mode": "yesno", "yes": yes }));
+                out.insert(branch.into(), json!(if text.is_empty() { branch } else { &text }));
+                return Ok(NodeOutcome::Done(out, c));
+            }
             let ans = j
                 .pointer("/answers/answer")
                 .cloned()
@@ -1387,11 +1422,12 @@ enum Gathered {
 /// Gather a node's inputs + field overrides from links (JS: every wired
 /// value is visible in `inp`; non-input ports additionally override the
 /// field). Only the single wired Value is cloned per link.
-fn gather_step(
+fn gather_step<'a>(
     node: &Node,
     graph: &Graph,
     outputs_by_node: &HashMap<String, Map<String, Value>>,
     records: &HashMap<String, NodeRecord>,
+    links: impl Iterator<Item = &'a Link> + Clone,
 ) -> Gathered {
     if node.ty == "comment" {
         return Gathered::Comment;
@@ -1402,7 +1438,7 @@ fn gather_step(
     let mut skipped_err: Vec<String> = Vec::new();
     let mut gate_blocked = false;
     let mut inbound = 0usize;
-    for l in graph.links.iter().filter(|l| l.to_node == node.id) {
+    for l in links.clone() {
         inbound += 1;
         if let Some(rec) = records.get(&l.from_node) {
             // display name only matters for failure bookkeeping — stay lazy
@@ -1439,7 +1475,7 @@ fn gather_step(
             .cloned()
             .unwrap_or(Value::Null);
         inputs.insert(l.to_port.clone(), v.clone());
-        if !is_input_port(node, &l.to_port) {
+        if !is_input_port(node, &l.to_port) && !(node.ty == "decide" && l.to_port == "branch") {
             effective
                 .get_or_insert_with(|| node.clone())
                 .fields
@@ -1450,10 +1486,7 @@ fn gather_step(
         return Gathered::UpstreamFailed(name);
     }
     if inbound > 0 && skipped_err.len() > 0 {
-        let skipped_sources = graph
-            .links
-            .iter()
-            .filter(|l| l.to_node == node.id)
+        let skipped_sources = links
             .filter(|l| {
                 records
                     .get(&l.from_node)
@@ -1524,7 +1557,7 @@ fn execute_step(g: Gathered, ctx: &Ctx) -> (NodeRecord, Map<String, Value>, bool
                 // fields.onError:"skip" — the failure is recorded (and counted
                 // in errors) but the node lands as skipped; dependents see
                 // empty ports and run on whatever else they have (JS).
-                if node.field_str("onError").as_deref() == Some("skip") {
+                if node.field_str("onError").as_deref() == Some("skip") && !branch_decider(&node) {
                     (
                         NodeRecord { status: "skipped".into(), out: Map::new(), error: Some(e.message.clone()), cost: e.cost },
                         Map::new(),
@@ -1554,6 +1587,71 @@ struct SchedState {
     pending: HashMap<String, usize>,
     ready: std::collections::VecDeque<String>,
     recorded: usize,
+    branch_skipped: HashSet<String>,
+}
+
+/// Shared routing rules with the JS and Python executors. Explicit Yes/No
+/// wires open branches. A join needs an active routed input. Ordinary inputs
+/// do not open an unselected branch.
+struct BranchPlan<'a> {
+    direct: HashSet<usize>,
+    selectors: HashMap<&'a str, Vec<usize>>,
+}
+
+impl<'a> BranchPlan<'a> {
+    fn new(graph: &'a Graph, order: &[String], by_id: &HashMap<&str, &'a Node>) -> Result<Self> {
+        let mut direct = HashSet::new();
+        for (idx, link) in graph.links.iter().enumerate() {
+            let source = by_id.get(link.from_node.as_str());
+            if let Some(node) = source.filter(|node| {
+                node.ty == "decide" && matches!(link.from_port.as_str(), "yes" | "no")
+            }) {
+                if !branch_decider(node) {
+                    return Err(NanoodleError(format!(
+                        "node {}: enable branching on Decide to wire {}",
+                        node.id, link.from_port
+                    )));
+                }
+                direct.insert(idx);
+            }
+        }
+        let mut selectors = HashMap::new();
+        if !direct.is_empty() {
+            let mut inbound: HashMap<&str, Vec<usize>> = HashMap::new();
+            for (idx, link) in graph.links.iter().enumerate() {
+                inbound.entry(&link.to_node).or_default().push(idx);
+            }
+            for id in order {
+                let links = inbound.get(id.as_str()).map(Vec::as_slice).unwrap_or(&[]);
+                let mut controls: Vec<_> = links.iter().copied()
+                    .filter(|idx| direct.contains(idx))
+                    .collect();
+                if controls.is_empty() {
+                    controls.extend(links.iter().copied().filter(|idx| {
+                        selectors.contains_key(graph.links[*idx].from_node.as_str())
+                    }));
+                }
+                if !controls.is_empty() {
+                    selectors.insert(by_id[id.as_str()].id.as_str(), controls);
+                }
+            }
+        }
+        Ok(Self { direct, selectors })
+    }
+
+    fn closed(&self, idx: usize, link: &Link, state: &SchedState) -> bool {
+        if state.branch_skipped.contains(&link.from_node) {
+            return true;
+        }
+        if !self.direct.contains(&idx) {
+            return false;
+        }
+        let selected = state.outputs_by_node.get(&link.from_node)
+            .and_then(|out| out.get("decision"))
+            .and_then(|d| d.get("branch"))
+            .and_then(Value::as_str);
+        matches!(selected, Some("yes" | "no")) && selected != Some(link.from_port.as_str())
+    }
 }
 
 /// Run a materialized graph; unknown types fail fast exactly like JS run().
@@ -1763,6 +1861,7 @@ pub fn run(graph: &Graph, ctx: &Ctx) -> std::result::Result<RunResult, RunFailur
     }
     let order = topo_sort(graph)?; // cycle check (names the cyclic nodes)
     let by_id: HashMap<&str, &Node> = graph.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
+    let branches = BranchPlan::new(graph, &order, &by_id)?;
     let total = graph.nodes.len();
 
     // Required-input validation (JS workflow.run): a derived input whose
@@ -1829,10 +1928,12 @@ pub fn run(graph: &Graph, ctx: &Ctx) -> std::result::Result<RunResult, RunFailur
         pending,
         ready,
         recorded: 0,
+        branch_skipped: HashSet::new(),
     });
     let cvar = std::sync::Condvar::new();
     let dependents_ref = &dependents;
     let by_id_ref = &by_id;
+    let branches_ref = &branches;
     let state_ref = &state;
     let cvar_ref = &cvar;
     let worker = move || loop {
@@ -1843,7 +1944,18 @@ pub fn run(graph: &Graph, ctx: &Ctx) -> std::result::Result<RunResult, RunFailur
                     return;
                 }
                 if let Some(id) = st.ready.pop_front() {
-                    let g = gather_step(by_id_ref[id.as_str()], graph, &st.outputs_by_node, &st.records);
+                    let inactive = branches_ref.selectors.get(id.as_str()).is_some_and(|controls| {
+                        controls.iter().all(|idx| branches_ref.closed(*idx, &graph.links[*idx], &st))
+                    });
+                    let g = if inactive {
+                        st.branch_skipped.insert(id.clone());
+                        Gathered::Blocked
+                    } else {
+                        let links = graph.links.iter().enumerate()
+                            .filter(|(idx, link)| link.to_node == id && !branches_ref.closed(*idx, link, &st))
+                            .map(|(_, link)| link);
+                        gather_step(by_id_ref[id.as_str()], graph, &st.outputs_by_node, &st.records, links)
+                    };
                     break (id, g);
                 }
                 st = cvar_ref.wait(st).unwrap();
