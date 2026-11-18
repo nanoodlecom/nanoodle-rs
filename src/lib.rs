@@ -1,0 +1,1964 @@
+//! nanoodle-rs — Rust executor for nanoodle graphs.
+//!
+//! Slice 1: loader (materialize) + local nodes (text / choice / join / comment /
+//! upload family). Semantics mirror nanoodle-js `graph.mjs` / `nodes.mjs`
+//! exactly; the shared conformance suite in `../executor-core/conformance/`
+//! is the contract. See `../executor-core/SPEC.md` and `RUST-BRIEF.md`.
+
+use serde_json::{json, Map, Value};
+use std::collections::{HashMap, HashSet};
+use std::fmt;
+use std::time::{Duration, Instant};
+
+pub mod audio;
+pub mod endpoint;
+pub mod local_media;
+pub mod video;
+
+// ---------------------------------------------------------------- errors
+
+#[derive(Debug)]
+pub struct NanoodleError(pub String);
+
+/// A failed run, mirroring JS RunError: the message plus the partial
+/// result (records, outputs, cost, errors) produced before the throw.
+/// Pre-run validation failures carry no result.
+pub struct RunFailure {
+    pub message: String,
+    pub result: Option<RunResult>,
+}
+
+impl From<NanoodleError> for RunFailure {
+    fn from(e: NanoodleError) -> Self {
+        RunFailure { message: e.0, result: None }
+    }
+}
+
+/// A node failure that may already have billed: JS fires onCost at submit
+/// time, so a job that fails while polling still counts its submit cost
+/// (and a decide "pick" whose second send fails keeps the first's cost).
+/// Plain NanoodleErrors convert with no cost attached.
+pub struct NodeError {
+    pub message: String,
+    pub cost: Option<f64>,
+}
+
+impl From<NanoodleError> for NodeError {
+    fn from(e: NanoodleError) -> Self {
+        NodeError { message: e.0, cost: None }
+    }
+}
+
+impl fmt::Display for NanoodleError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+impl std::error::Error for NanoodleError {}
+
+pub type Result<T> = std::result::Result<T, NanoodleError>;
+
+// ---------------------------------------------------------------- registry
+
+/// (title, static inputs, output ports) per node type — mirrors JS NODE_TYPES.
+fn node_type(ty: &str) -> Option<(&'static str, &'static [&'static str], &'static [&'static str])> {
+    Some(match ty {
+        "text" => ("Text", &[][..], &["text"][..]),
+        "upload" => ("Image input", &[][..], &["image"][..]),
+        "aupload" => ("Audio input", &[][..], &["audio"][..]),
+        "vupload" => ("Video input", &[][..], &["video"][..]),
+        "mupload" => ("3D input", &[][..], &["model"][..]),
+        "choice" => ("Choice", &[][..], &["text"][..]),
+        "join" => ("Join", &["a", "b"][..], &["text"][..]),
+        "llm" => ("LLM", &[][..], &["text"][..]),
+        "image" => ("Image", &[][..], &["image"][..]),
+        "edit" => ("Edit", &[][..], &["image"][..]),
+        "inpaint" => ("Inpaint", &["image", "mask"][..], &["image"][..]),
+        "resize" => ("Resize / crop", &["image"][..], &["image"][..]),
+        "vision" => ("Vision", &["image"][..], &["text"][..]),
+        "decide" => ("Decide", &["text"][..], &["text", "image"][..]),
+        "tvideo" => ("Text→Video", &[][..], &["video"][..]),
+        "ivideo" => ("Image→Video", &["image"][..], &["video"][..]),
+        "model3d" => ("3D model", &["image", "model"][..], &["model"][..]),
+        "vedit" => ("Video edit", &["video"][..], &["video"][..]),
+        "vframes" => ("Video → frames", &["video"][..], &["frame1"][..]),
+        "combine" => ("Combine videos", &[][..], &["video"][..]),
+        "soundtrack" => ("Soundtrack", &["video", "audio"][..], &["video"][..]),
+        "lipsync" => ("Avatar / lipsync", &["image", "audio"][..], &["video"][..]),
+        "music" => ("Music", &[][..], &["audio"][..]),
+        "remix" => ("Remix audio", &["audio"][..], &["audio"][..]),
+        "tts" => ("Speech", &[][..], &["audio"][..]),
+        "trim" => ("Trim audio", &["audio"][..], &["audio"][..]),
+        "extractaudio" => ("Extract audio", &["video"][..], &["audio"][..]),
+        "transcribe" => ("Transcribe", &["audio"][..], &["text"][..]),
+        "cleanvoice" => ("Clean voice", &["audio", "video"][..], &["audio"][..]),
+        "endpoint" => ("Custom endpoint", &["text", "image", "audio", "video"][..], &["text"][..]),
+        "comment" => ("Comment", &[][..], &[][..]),
+        _ => return None,
+    })
+}
+
+pub const NODE_TYPE_NAMES: &[&str] = &[
+    "text", "upload", "aupload", "vupload", "mupload", "choice", "join", "llm",
+    "image", "edit", "inpaint", "resize", "vision", "decide", "tvideo", "ivideo",
+    "model3d", "vedit", "vframes", "combine", "soundtrack", "lipsync", "music",
+    "remix", "tts", "trim", "extractaudio", "transcribe", "cleanvoice",
+    "endpoint", "comment",
+];
+
+fn dynamic_input_name(port: &str) -> bool {
+    port == "audio" || port == "endframe"
+}
+
+/// ^img\d+$ | ^image\d*$ | ^vid\d+$ | ^clip\d+$ | ^ref\d+$  (JS DYNAMIC_INPUT_RES;
+/// frame ports are deliberately NOT here — vframes wiring is handled apart).
+fn dynamic_input_re(port: &str) -> bool {
+    fn digits(s: &str) -> bool {
+        !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+    }
+    if let Some(r) = port.strip_prefix("img") {
+        return digits(r);
+    }
+    if let Some(r) = port.strip_prefix("image") {
+        return r.is_empty() || digits(r);
+    }
+    if let Some(r) = port.strip_prefix("vid") {
+        return digits(r);
+    }
+    if let Some(r) = port.strip_prefix("clip") {
+        return digits(r);
+    }
+    if let Some(r) = port.strip_prefix("ref") {
+        return digits(r);
+    }
+    false
+}
+
+pub fn is_input_port(node: &Node, port: &str) -> bool {
+    if let Some((_, inputs, _)) = node_type(&node.ty) {
+        if inputs.contains(&port) {
+            return true;
+        }
+    }
+    dynamic_input_name(port) || dynamic_input_re(port)
+}
+
+// ---------------------------------------------------------------- graph
+
+#[derive(Debug, Clone)]
+pub struct Node {
+    pub id: String,
+    pub ty: String,
+    pub name: Option<String>,
+    pub fields: Map<String, Value>,
+    pub unknown: bool,
+}
+
+impl Node {
+    pub fn display_name(&self) -> String {
+        if let Some(n) = &self.name {
+            let t = n.trim();
+            if !t.is_empty() {
+                return t.to_string();
+            }
+        }
+        node_type(&self.ty).map(|(title, _, _)| title.to_string()).unwrap_or_else(|| self.ty.clone())
+    }
+    pub fn field_str(&self, key: &str) -> Option<String> {
+        match self.fields.get(key) {
+            Some(Value::String(s)) => Some(s.clone()),
+            Some(Value::Number(n)) => Some(n.to_string()),
+            Some(Value::Bool(b)) => Some(b.to_string()),
+            _ => None,
+        }
+    }
+    pub fn optional(&self) -> bool {
+        match self.fields.get("optional") {
+            Some(Value::Bool(true)) => true,
+            Some(Value::String(s)) => s == "true",
+            _ => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Link {
+    pub from_node: String,
+    pub from_port: String,
+    pub to_node: String,
+    pub to_port: String,
+}
+
+#[derive(Debug)]
+pub struct Graph {
+    pub nodes: Vec<Node>,
+    pub links: Vec<Link>,
+    pub warnings: Vec<String>,
+}
+
+const MEDIA_FIELD_KEYS: [&str; 4] = ["image", "mask", "audio", "video"];
+
+fn is_media_url(s: &str) -> bool {
+    let t = s.trim().to_ascii_lowercase();
+    t.starts_with("data:") || t.starts_with("http:") || t.starts_with("https:")
+}
+
+fn scrub_media_placeholders(n: &mut Node, warnings: &mut Vec<String>) {
+    let mut keys: Vec<&str> = MEDIA_FIELD_KEYS.to_vec();
+    if n.ty == "mupload" {
+        keys.push("model");
+    }
+    for k in keys {
+        let v = match n.fields.get(k) {
+            None | Some(Value::Null) => continue,
+            Some(Value::String(s)) if s.is_empty() || is_media_url(s) => continue,
+            Some(v) => v.clone(),
+        };
+        let shown = match &v {
+            Value::String(s) if s.chars().count() > 60 => {
+                format!("\"{}…\"", s.chars().take(57).collect::<String>())
+            }
+            Value::String(s) => format!("\"{}\"", s),
+            Value::Array(_) => "an array".to_string(),
+            Value::Object(_) => "an object".to_string(),
+            other => format!("a {}", other_type(other)),
+        };
+        n.fields.insert(k.to_string(), Value::String(String::new()));
+        warnings.push(format!(
+            "node {} ({}): fields.{} held {} — not a data: or http(s) URL, so it was treated as empty.",
+            n.id, n.display_name(), k, shown
+        ));
+    }
+}
+
+fn other_type(v: &Value) -> &'static str {
+    match v {
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        _ => "value",
+    }
+}
+
+/// Load raw parsed graph JSON into an executable graph. Mirrors JS materialize.
+pub fn materialize(data: &Value) -> Result<Graph> {
+    let obj = data.as_object().ok_or_else(|| {
+        NanoodleError("not a nanoodle graph: expected an object with a nodes array".into())
+    })?;
+    let raw_nodes = obj.get("nodes").and_then(|v| v.as_array()).ok_or_else(|| {
+        NanoodleError("not a nanoodle graph: expected an object with a nodes array".into())
+    })?;
+    let mut warnings = Vec::new();
+    let mut nodes: Vec<Node> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for raw in raw_nodes {
+        let (id, ty) = match (raw.get("id"), raw.get("type")) {
+            (Some(i), Some(t)) if !i.is_null() => {
+                let id = match i {
+                    Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                let ty = t.as_str().unwrap_or("").to_string();
+                if ty.is_empty() {
+                    continue;
+                }
+                (id, ty)
+            }
+            _ => continue,
+        };
+        if !seen.insert(id.clone()) {
+            return Err(NanoodleError(format!(
+                "duplicate node id \"{}\" — every node must have a unique id",
+                id
+            )));
+        }
+        let ty = if ty == "audio" { "tts".to_string() } else { ty };
+        let mut n = Node {
+            id,
+            name: raw.get("name").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            fields: raw.get("fields").and_then(|v| v.as_object()).cloned().unwrap_or_default(),
+            unknown: false,
+            ty,
+        };
+        if node_type(&n.ty).is_none() {
+            n.unknown = true;
+            warnings.push(format!(
+                "unknown node type \"{}\" (node {}) — kept, but running this workflow will fail; you may need a newer nanoodle library",
+                raw.get("type").and_then(|v| v.as_str()).unwrap_or(""),
+                n.id
+            ));
+        } else {
+            scrub_media_placeholders(&mut n, &mut warnings);
+        }
+        nodes.push(n);
+    }
+    let ids: HashSet<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
+    let by_id: HashMap<&str, &Node> = nodes.iter().map(|n| (n.id.as_str(), n)).collect();
+    let mut links = Vec::new();
+    if let Some(raw_links) = obj.get("links").and_then(|v| v.as_array()) {
+        for l in raw_links {
+            let (f, t) = match (l.get("from"), l.get("to")) {
+                (Some(f), Some(t)) => (f, t),
+                _ => continue,
+            };
+            let (fn_, fp) = (node_id_str(f.get("node")), port_str(f.get("port")));
+            let (tn, mut tp) = (node_id_str(t.get("node")), port_str(t.get("port")));
+            if fn_.is_empty() || !ids.contains(fn_.as_str()) || !ids.contains(tn.as_str()) {
+                continue;
+            }
+            if let Some(to_node) = by_id.get(tn.as_str()) {
+                if (to_node.ty == "music" || to_node.ty == "tts") && tp == "text" {
+                    tp = "prompt".to_string();
+                }
+            }
+            links.push(Link { from_node: fn_, from_port: fp, to_node: tn, to_port: tp });
+        }
+    }
+    Ok(Graph { nodes, links, warnings })
+}
+
+fn node_id_str(v: Option<&Value>) -> String {
+    match v {
+        Some(Value::String(s)) => s.clone(),
+        Some(other) if !other.is_null() => other.to_string(),
+        _ => String::new(),
+    }
+}
+
+fn port_str(v: Option<&Value>) -> String {
+    match v {
+        Some(Value::String(s)) => s.clone(),
+        Some(other) if !other.is_null() => other.to_string(),
+        _ => String::new(),
+    }
+}
+
+/// Kahn topological sort (stable: graph order breaks ties). Errors name the cycle.
+pub fn topo_sort(graph: &Graph) -> Result<Vec<String>> {
+    let mut indeg: HashMap<&str, usize> = graph.nodes.iter().map(|n| (n.id.as_str(), 0)).collect();
+    let mut out_adj: HashMap<&str, Vec<&str>> = graph.nodes.iter().map(|n| (n.id.as_str(), Vec::new())).collect();
+    for l in &graph.links {
+        if let Some(v) = out_adj.get_mut(l.from_node.as_str()) {
+            v.push(l.to_node.as_str());
+        }
+        if let Some(d) = indeg.get_mut(l.to_node.as_str()) {
+            *d += 1;
+        }
+    }
+    let mut order = Vec::new();
+    let mut ready: Vec<&str> = graph
+        .nodes
+        .iter()
+        .filter(|n| indeg[n.id.as_str()] == 0)
+        .map(|n| n.id.as_str())
+        .collect();
+    let mut qi = 0;
+    while qi < ready.len() {
+        let id = ready[qi];
+        qi += 1;
+        order.push(id.to_string());
+        if let Some(targets) = out_adj.get(id) {
+            for t in targets.clone() {
+                let d = indeg.get_mut(t).unwrap();
+                *d -= 1;
+                if *d == 0 {
+                    ready.push(t);
+                }
+            }
+        }
+    }
+    if order.len() != graph.nodes.len() {
+        let in_order: HashSet<&str> = order.iter().map(|s| s.as_str()).collect();
+        let cyc: Vec<&str> = graph
+            .nodes
+            .iter()
+            .map(|n| n.id.as_str())
+            .filter(|id| !in_order.contains(id))
+            .collect();
+        return Err(NanoodleError(format!("graph has a cycle involving: {}", cyc.join(", "))));
+    }
+    Ok(order)
+}
+
+// ---------------------------------------------------------------- http ctx
+
+/// Execution context: where NanoGPT lives + the key. One ureq Agent = one
+/// keep-alive connection pool (the fanout lesson from BENCHMARKS.md).
+/// One classification of an async job's status response. Every NanoGPT
+/// long-running job (video, 3D, audio, lipsync) is the same implicit state
+/// machine — submit → poll → (Pending)* → Done | Failed — with transient poll
+/// errors (network, 5xx, 408, 429) staying in Pending and terminal 4xx
+/// failing fast. The families used to hand-roll this loop three times; now
+/// each step() classifies a single response and `poll_loop` owns the shared
+/// machine: cadence, deadline, timeout error.
+pub enum PollStep<T> {
+    Pending,
+    Done(T),
+    Failed(String),
+}
+
+/// Drive a PollStep state machine to its terminal state.
+pub fn poll_loop<T>(
+    interval: Duration,
+    cap: Duration,
+    timeout: String,
+    mut step: impl FnMut() -> Result<PollStep<T>>,
+) -> Result<T> {
+    let start = Instant::now();
+    loop {
+        std::thread::sleep(interval);
+        if start.elapsed() >= cap {
+            return Err(NanoodleError(timeout));
+        }
+        match step()? {
+            PollStep::Pending => continue,
+            PollStep::Done(v) => return Ok(v),
+            PollStep::Failed(m) => return Err(NanoodleError(m)),
+        }
+    }
+}
+
+/// Look up a model in an opt-in catalog (JS catalog.mjs catItem): the raw
+/// arrays the NanoGPT catalog endpoints return, keyed chat/image/video/audio.
+/// Permissive: no catalog, or a model absent from it, changes nothing.
+pub fn cat_item<'a>(catalog: &'a Value, kind: &str, id: &str) -> Option<&'a Value> {
+    catalog
+        .get(kind)?
+        .as_array()?
+        .iter()
+        .find(|m| m.get("id").and_then(|v| v.as_str()) == Some(id))
+}
+
+pub struct Ctx {
+    pub base_url: String,
+    pub api_key: String,
+    /// Opt-in model catalog ({chat, image, video, audio} raw arrays), never
+    /// fetched by the library — the caller supplies it, like the JS SDK.
+    pub catalog: Option<Value>,
+    agent: ureq::Agent,
+}
+
+impl Ctx {
+    pub fn new(base_url: &str, api_key: &str) -> Ctx {
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .build()
+            .into();
+        Ctx {
+            base_url: base_url.trim_end_matches('/').to_string(),
+            api_key: api_key.to_string(),
+            catalog: None,
+            agent,
+        }
+    }
+
+    /// POST JSON, mirroring JS client.httpError + costWithHeaders behavior.
+    /// Returns (parsed body, cost USD if known).
+    pub fn post_json(&self, path: &str, body: &Value) -> Result<(Value, Option<f64>)> {
+        let url = format!("{}{}", self.base_url, path);
+        let mut resp = self
+            .agent
+            .post(&url)
+            .header("Authorization", &format!("Bearer {}", self.api_key))
+            .header("Content-Type", "application/json")
+            .send_json(body)
+            .map_err(|e| NanoodleError(format!("request failed: {}", e)))?;
+        let status = resp.status().as_u16();
+        let pricing_header = resp
+            .headers()
+            .get("x-nanogpt-pricing")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        let text = resp
+            .body_mut()
+            .read_to_string()
+            .map_err(|e| NanoodleError(format!("response read failed: {}", e)))?;
+        if !(200..300).contains(&status) {
+            return Err(http_error(status, &text));
+        }
+        let j: Value = serde_json::from_str(&text)
+            .map_err(|e| NanoodleError(format!("invalid JSON response: {}", e)))?;
+        let cost = cost_of(&j, pricing_header.as_deref());
+        Ok((j, cost))
+    }
+
+    /// GET JSON (video status polling). Returns (parsed body, cost if known).
+    pub fn get_json(&self, path: &str) -> Result<(Value, Option<f64>)> {
+        let url = format!("{}{}", self.base_url, path);
+        let mut resp = self
+            .agent
+            .get(&url)
+            .header("Authorization", &format!("Bearer {}", self.api_key))
+            .call()
+            .map_err(|e| NanoodleError(format!("request failed: {}", e)))?;
+        let status = resp.status().as_u16();
+        let text = resp
+            .body_mut()
+            .read_to_string()
+            .map_err(|e| NanoodleError(format!("response read failed: {}", e)))?;
+        if !(200..300).contains(&status) {
+            return Err(http_error(status, &text));
+        }
+        let j: Value = serde_json::from_str(&text)
+            .map_err(|e| NanoodleError(format!("invalid JSON response: {}", e)))?;
+        let cost = cost_of(&j, None);
+        Ok((j, cost))
+    }
+
+    /// POST raw bytes with an explicit content type (TTS/music return audio
+    /// bytes; callers that need them use this). Returns (status, content-type,
+    /// bytes, cost) — cost comes from the x-nanogpt-pricing header when the
+    /// body is binary (JS reads it there too).
+    pub fn post_bytes(&self, path: &str, body: &Value) -> Result<(u16, String, Vec<u8>, Option<f64>)> {
+        let url = format!("{}{}", self.base_url, path);
+        let mut resp = self
+            .agent
+            .post(&url)
+            .header("Authorization", &format!("Bearer {}", self.api_key))
+            .header("Content-Type", "application/json")
+            .send_json(body)
+            .map_err(|e| NanoodleError(format!("request failed: {}", e)))?;
+        let status = resp.status().as_u16();
+        let ctype = resp
+            .headers()
+            .get("Content-Type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let pricing_header = resp
+            .headers()
+            .get("x-nanogpt-pricing")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        let bytes = resp
+            .body_mut()
+            .read_to_vec()
+            .map_err(|e| NanoodleError(format!("response read failed: {}", e)))?;
+        let cost = pricing_header
+            .as_deref()
+            .and_then(|h| serde_json::from_str::<Value>(h).ok())
+            .and_then(|p| {
+                ["costUsd", "cost", "amount"]
+                    .iter()
+                    .find_map(|k| p.get(k).and_then(|v| v.as_f64()))
+            });
+        Ok((status, ctype, bytes, cost))
+    }
+}
+
+fn http_error(status: u16, body: &str) -> NanoodleError {
+    if status == 401 || status == 403 {
+        return NanoodleError(format!(
+            "API key rejected (HTTP {}) — check your NanoGPT key / NANOGPT_API_KEY",
+            status
+        ));
+    }
+    let low = body.to_ascii_lowercase();
+    if status == 402
+        || ["insufficient", "balance", "funds", "not enough", "payment required"]
+            .iter()
+            .any(|k| low.contains(k))
+    {
+        return NanoodleError(
+            "out of balance — this run needs more credit. Top up at nano-gpt.com, then run again."
+                .into(),
+        );
+    }
+    NanoodleError(format!("{}: {}", status, body.chars().take(160).collect::<String>()))
+}
+
+/// USD cost priority (JS costFromJson): j.cost (>0) → x_nanogpt_pricing.
+/// (costUsd|cost|amount) → metadata.cost → j.cost even when 0 → header pricing.
+fn cost_of(j: &Value, pricing_header: Option<&str>) -> Option<f64> {
+    let num = |v: &Value| v.as_f64();
+    if let Some(c) = j.get("cost").and_then(num) {
+        if c > 0.0 {
+            return Some(c);
+        }
+    }
+    let from_pricing = |p: &Value| {
+        ["costUsd", "cost", "amount"]
+            .iter()
+            .find_map(|k| p.get(k).and_then(num))
+    };
+    if let Some(p) = j.get("x_nanogpt_pricing") {
+        if let Some(c) = from_pricing(p) {
+            return Some(c);
+        }
+    }
+    if let Some(c) = j.get("metadata").and_then(|m| m.get("cost")).and_then(num) {
+        return Some(c);
+    }
+    if let Some(c) = j.get("cost").and_then(num) {
+        return Some(c);
+    }
+    if let Some(h) = pricing_header {
+        if let Ok(p) = serde_json::from_str::<Value>(h) {
+            return from_pricing(&p);
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------- engine
+
+#[derive(Debug, Default)]
+pub struct NodeRecord {
+    pub status: String, // done | error | gated | skipped
+    pub out: Map<String, Value>,
+    pub error: Option<String>,
+    pub cost: Option<f64>,
+}
+
+#[derive(Debug, Default)]
+pub struct RunResult {
+    pub outputs: Map<String, Value>,
+    pub nodes: HashMap<String, NodeRecord>,
+    pub errors: Vec<String>,
+    pub cost_usd: f64,
+}
+
+pub fn value_text(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}
+
+pub enum NodeOutcome {
+    Done(Map<String, Value>, Option<f64>),
+    /// Decide yes/no gate answered no: the node ran and billed, `out` holds its
+    /// answer, downstream is skipped (JS status "gated").
+    Gated(Map<String, Value>, Option<f64>),
+}
+
+fn run_node(
+    node: &Node,
+    inputs: &HashMap<String, Value>,
+    ctx: &Ctx,
+) -> std::result::Result<NodeOutcome, NodeError> {
+    match node.ty.as_str() {
+        "llm" => run_llm(node, inputs, ctx).map_err(Into::into),
+        "vision" => run_vision(node, inputs, ctx).map_err(Into::into),
+        "decide" => run_decide(node, inputs, ctx),
+        "image" => run_image(node, inputs, ctx).map_err(Into::into),
+        "edit" => run_edit(node, inputs, ctx).map_err(Into::into),
+        "tvideo" => video::run_tvideo(node, inputs, ctx),
+        "ivideo" => video::run_ivideo(node, inputs, ctx),
+        "vedit" => video::run_vedit(node, inputs, ctx),
+        "model3d" => video::run_model3d(node, inputs, ctx),
+        "music" => audio::run_music(node, inputs, ctx),
+        "tts" => audio::run_tts(node, inputs, ctx),
+        "remix" => audio::run_remix(node, inputs, ctx),
+        "transcribe" => audio::run_transcribe(node, inputs, ctx).map_err(Into::into),
+        "cleanvoice" => audio::run_cleanvoice(node, inputs, ctx),
+        "endpoint" => endpoint::run_endpoint(node, inputs, ctx).map_err(Into::into),
+        "resize" => local_media::run_resize(node, inputs, ctx).map_err(Into::into),
+        "vframes" => local_media::run_vframes(node, inputs, ctx).map_err(Into::into),
+        "combine" => local_media::run_combine(node, inputs, ctx).map_err(Into::into),
+        "soundtrack" => local_media::run_soundtrack(node, inputs, ctx).map_err(Into::into),
+        "trim" => local_media::run_trim(node, inputs, ctx).map_err(Into::into),
+        "extractaudio" => local_media::run_extractaudio(node, inputs, ctx).map_err(Into::into),
+        "inpaint" => local_media::run_inpaint(node, inputs, ctx).map_err(Into::into),
+        "lipsync" => local_media::run_lipsync(node, inputs, ctx),
+        _ => run_local_node(node, inputs)
+            .map(|out| NodeOutcome::Done(out, Some(0.0)))
+            .map_err(Into::into),
+    }
+}
+
+pub fn input_text(inputs: &HashMap<String, Value>, port: &str) -> Option<String> {
+    inputs.get(port).map(value_text).filter(|s| !s.is_empty())
+}
+
+/// Wired image ports (img1, img2, …) in numeric order — JS collectPorts(IMG_PORT_RE).
+fn collect_img_ports(inputs: &HashMap<String, Value>) -> Vec<String> {
+    let mut ports: Vec<(u32, &String)> = inputs
+        .iter()
+        .filter_map(|(k, v)| {
+            let rest = k.strip_prefix("img")?;
+            if !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()) {
+                if let Value::String(s) = v {
+                    if !s.is_empty() {
+                        return Some((rest.parse().unwrap_or(0), s));
+                    }
+                }
+            }
+            None
+        })
+        .collect();
+    ports.sort_by_key(|(n, _)| *n);
+    ports.into_iter().map(|(_, s)| s.clone()).collect()
+}
+
+pub fn model_of(node: &Node) -> String {
+    node.field_str("model").unwrap_or_default()
+}
+
+/// JS mdl(): the model field, verbatim; empty is a hard error before any
+/// request. Every model-driven runner except model3d (defaults to Tripo)
+/// and cleanvoice (has a default) goes through here.
+pub fn mdl(node: &Node) -> Result<String> {
+    let m = model_of(node).trim().to_string();
+    if m.is_empty() {
+        return Err(NanoodleError(format!("pick a model first (node {})", node.id)));
+    }
+    Ok(m)
+}
+
+/// POST /api/v1/chat/completions — mirrors JS client.chat.
+fn chat(
+    ctx: &Ctx,
+    messages: Value,
+    model: &str,
+    temperature: Option<f64>,
+    response_format: bool,
+    reasoning_effort: Option<&str>,
+    show_thinking: bool,
+) -> Result<(String, Option<f64>)> {
+    let mut body = json!({ "model": model, "messages": messages });
+    if model != "google/gemini-4-carbon" {
+        body["temperature"] = json!(temperature.unwrap_or(0.8));
+    }
+    if response_format {
+        body["response_format"] = json!({ "type": "json_object" });
+    }
+    if model != "google/gemini-4-carbon" {
+        if let Some(e) = reasoning_effort {
+            body["reasoning_effort"] = json!(e);
+        }
+    }
+    let (j, cost) = ctx.post_json("/api/v1/chat/completions", &body)?;
+    let msg = j
+        .get("choices")
+        .and_then(|c| c.get(0))
+        .and_then(|c| c.get("message"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let content = msg.get("content").cloned().unwrap_or(Value::Null);
+    let mut out = match &content {
+        Value::String(s) => s.clone(),
+        Value::Array(parts) => parts
+            .iter()
+            .map(|p| p.get("text").and_then(|t| t.as_str()).unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join(""),
+        _ => return Err(NanoodleError("no text in response".into())),
+    };
+    if show_thinking {
+        if let Some(r) = msg.get("reasoning").and_then(|r| r.as_str()) {
+            out = format!("```thinking\n{}\n```\n\n{}", r, out);
+        }
+    }
+    Ok((out, cost))
+}
+
+fn run_llm(
+    node: &Node,
+    inputs: &HashMap<String, Value>,
+    ctx: &Ctx,
+) -> Result<NodeOutcome> {
+    let prompt = prompt_of(node, inputs)
+        .ok_or_else(|| NanoodleError("no prompt".into()))?;
+    let imgs = collect_img_ports(inputs);
+    // IO def backfill: an empty system field means the documented default.
+    let system = node.field_str("system").unwrap_or_default();
+    let system = if system.trim().is_empty() {
+        "You are a helpful, concise assistant.".to_string()
+    } else {
+        system.trim().to_string()
+    };
+    let mut messages = vec![json!({ "role": "system", "content": system })];
+    if imgs.is_empty() {
+        messages.push(json!({ "role": "user", "content": prompt }));
+    } else {
+        let mut content = vec![json!({ "type": "text", "text": prompt })];
+        for u in &imgs {
+            content.push(json!({ "type": "image_url", "image_url": { "url": u } }));
+        }
+        messages.push(json!({ "role": "user", "content": content }));
+    }
+    let temperature = node.field_str("temperature").and_then(|s| s.parse::<f64>().ok());
+    let response_format = node.field_str("format").as_deref() == Some("JSON");
+    let effort = node.field_str("reasoningEffort");
+    let effort = effort.as_deref().filter(|e| !e.is_empty() && *e != "default");
+    let show_thinking = matches!(node.fields.get("showThinking"), Some(Value::Bool(true)))
+        || node.field_str("showThinking").as_deref() == Some("true");
+    // NOTE: no max_tokens — follows the JS SDK (divergence D1, undecided).
+    let (text, cost) = chat(
+        ctx,
+        Value::Array(messages),
+        &mdl(node)?,
+        temperature,
+        response_format,
+        effort,
+        show_thinking,
+    )?;
+    let mut out = Map::new();
+    out.insert("text".into(), json!(text));
+    Ok(NodeOutcome::Done(out, cost))
+}
+
+fn run_vision(
+    node: &Node,
+    inputs: &HashMap<String, Value>,
+    ctx: &Ctx,
+) -> Result<NodeOutcome> {
+    let img = input_text(inputs, "image")
+        .ok_or_else(|| NanoodleError("no image input".into()))?;
+    let q = node.field_str("q").unwrap_or_default();
+    let q = if q.trim().is_empty() { "Describe this image." } else { q.trim() };
+    let messages = json!([{
+        "role": "user",
+        "content": [
+            { "type": "text", "text": q },
+            { "type": "image_url", "image_url": { "url": img } }
+        ]
+    }]);
+    let (text, cost) = chat(ctx, messages, &mdl(node)?, None, false, None, false)?;
+    let mut out = Map::new();
+    out.insert("text".into(), json!(text));
+    Ok(NodeOutcome::Done(out, cost))
+}
+
+// ---- decide (mirrors JS decide.mjs; image fitting is identity in this slice —
+// the conformance corpus uses small data: URLs that JS also passes unchanged)
+
+fn decide_lines(s: &str) -> Vec<String> {
+    s.split('\n').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect()
+}
+
+fn run_decide(
+    node: &Node,
+    inputs: &HashMap<String, Value>,
+    ctx: &Ctx,
+) -> std::result::Result<NodeOutcome, NodeError> {
+    let f = &node.fields;
+    let mode_raw = node.field_str("mode").unwrap_or_default();
+    let mode = match mode_raw.as_str() {
+        "choose" | "score" | "yesno" => mode_raw.as_str(),
+        _ => "pick",
+    };
+    let text = input_text(inputs, "text").unwrap_or_default().trim().to_string();
+    let imgs = collect_img_ports(inputs);
+    let question = node.field_str("question").unwrap_or_default();
+    let question = if question.trim().is_empty() {
+        match mode {
+            "pick" => "Which image best matches the brief?",
+            "choose" => "Which label fits best?",
+            "score" => "How good is it?",
+            _ => "Is it good enough to use?",
+        }
+        .to_string()
+    } else {
+        question.trim().to_string()
+    };
+    // question object
+    let q: Value = match mode {
+        "pick" => {
+            if imgs.len() < 2 {
+                return Err(NodeError::from(NanoodleError(
+                    "pick needs at least two images — wire 2 or more into the image ports".into(),
+                )));
+            }
+            let mut criteria = Map::new();
+            for i in 1..=imgs.len() {
+                criteria.insert(format!("image_{}", i), json!(format!("image {}", i)));
+            }
+            json!({ "type": "choice", "instructions": question, "criteria": criteria })
+        }
+        "choose" => {
+            let mut labels: Vec<String> = Vec::new();
+            for l in decide_lines(&node.field_str("options").unwrap_or_default()) {
+                if !labels.contains(&l) {
+                    labels.push(l);
+                }
+            }
+            if labels.len() < 2 {
+                return Err(NodeError::from(NanoodleError(
+                    "add at least two labels to choose from (one per line)".into(),
+                )));
+            }
+            if labels.len() > 255 {
+                return Err(NodeError::from(NanoodleError("too many labels — 255 at most".into())));
+            }
+            let mut criteria = Map::new();
+            for l in &labels {
+                criteria.insert(l.clone(), Value::Null);
+            }
+            json!({ "type": "choice", "instructions": question, "criteria": criteria })
+        }
+        "score" => {
+            let levels_raw = node.field_str("levels").unwrap_or_default();
+            let levels = if levels_raw.trim().is_empty() {
+                decide_lines("poor\nokay\ngood\ngreat")
+            } else {
+                decide_lines(&levels_raw)
+            };
+            if levels.len() < 2 || levels.len() > 10 {
+                return Err(NodeError::from(NanoodleError(
+                    "the scale needs 2 to 10 levels, worst first (one per line)".into(),
+                )));
+            }
+            json!({ "type": "score", "instructions": question, "criteria": levels })
+        }
+        _ => json!({ "type": "noul", "instructions": question }),
+    };
+    if text.is_empty() && imgs.is_empty() && node.field_str("question").unwrap_or_default().trim().is_empty() {
+        return Err(NodeError::from(NanoodleError("nothing to judge — wire text or an image into Decide".into())));
+    }
+    let model = mdl(node)?;
+    // Image limits + fitting (JS decideRun): no catalog row → permissive
+    // launch limits; a catalog row WITH decision_input decides — no
+    // image_input means the model can't see images at all.
+    let sent: Vec<String> = if imgs.is_empty() {
+        Vec::new()
+    } else {
+        let item = ctx
+            .catalog
+            .as_ref()
+            .and_then(|c| cat_item(c, "chat", &model));
+        let di = item
+            .as_ref()
+            .and_then(|it| it.get("decision_input"))
+            .filter(|v| !v.is_null());
+        let lim: Option<(usize, i64, usize)> = match di {
+            None => Some((4, 512, 240000)),
+            Some(di) => {
+                let sees = matches!(di.get("image_input"), Some(v) if !matches!(v, Value::Bool(false)));
+                if !sees {
+                    None
+                } else {
+                    let l = di.get("image_limits");
+                    let get = |k: &str, dflt: i64| -> i64 {
+                        l.and_then(|l| l.get(k))
+                            .and_then(|v| v.as_f64())
+                            .filter(|n| *n > 0.0)
+                            .map(|n| n as i64)
+                            .unwrap_or(dflt)
+                    };
+                    Some((get("maxImages", 4) as usize, get("maxDimension", 512), get("maxEncodedBytes", 240000) as usize))
+                }
+            }
+        };
+        let (max_images, max_dim, max_bytes) = match lim {
+            None => {
+                return Err(NodeError::from(NanoodleError(
+                    "this decision model can't see images — pick one that can (e.g. PPLX Decider or Clef)".into(),
+                )))
+            }
+            Some(l) => l,
+        };
+        if imgs.len() > max_images {
+            return Err(NodeError::from(NanoodleError(format!(
+                "this decision model takes at most {} images — unwire the extras",
+                max_images
+            ))));
+        }
+        let budget = (max_bytes as f64 * 0.95 / imgs.len() as f64).floor() as usize;
+        let mut fitted = Vec::with_capacity(imgs.len());
+        for u in &imgs {
+            fitted.push(local_media::fit_image_jpeg(u, max_dim, budget)?);
+        }
+        fitted
+    };
+    let state_for = |ordered: &[String]| -> Value {
+        if ordered.is_empty() {
+            return json!(text);
+        }
+        let mut parts: Vec<Value> = Vec::new();
+        if !text.is_empty() {
+            parts.push(json!(text));
+        }
+        for (i, u) in ordered.iter().enumerate() {
+            if ordered.len() > 1 {
+                parts.push(json!(format!("image_{}:", i + 1)));
+            }
+            parts.push(json!({ "type": "image_url", "image_url": { "url": u } }));
+        }
+        Value::Array(parts)
+    };
+    let send = |state: Value| -> Result<(Value, Option<f64>)> {
+        let body = json!({ "model": model, "state": state, "questions": { "answer": q } });
+        let (j, c) = ctx.post_json("/api/v1/decisions", &body)?;
+        // Standard cost extraction first (same as every other family); the
+        // decisions API also reports usage.cost — keep it as a fallback.
+        // (Was: usage.cost only, which silently dropped top-level cost.)
+        let cost = c.or_else(|| {
+            j.get("usage").and_then(|u| u.get("cost")).and_then(|v| v.as_f64())
+        });
+        Ok((j, cost))
+    };
+    let _ = f;
+    let (ans, cost, out_text, out_image) = match mode {
+        "pick" => {
+            // ask in order and reversed, average the probabilities back (JS decideRun)
+            let fwd: Vec<String> = sent.clone();
+            let rev: Vec<String> = sent.iter().rev().cloned().collect();
+            let (j1, c1) = send(state_for(&fwd))?;
+            // A failed second send still billed the first (JS onCost per send).
+            let (j2, c2) = send(state_for(&rev))
+                .map_err(|e| NodeError { message: e.0, cost: c1 })?;
+            let probs_of = |j: &Value| -> Map<String, Value> {
+                j.pointer("/answers/answer/probabilities")
+                    .and_then(|p| p.as_object())
+                    .cloned()
+                    .unwrap_or_default()
+            };
+            let p1 = probs_of(&j1);
+            let p2 = probs_of(&j2);
+            let n = imgs.len();
+            let mut sums = vec![0.0f64; n];
+            for (k, orig) in (0..n).enumerate() {
+                sums[orig] += p1.get(&format!("image_{}", k + 1)).and_then(|v| v.as_f64()).unwrap_or(0.0) / 2.0;
+            }
+            for (k, orig) in (0..n).rev().enumerate() {
+                sums[orig] += p2.get(&format!("image_{}", k + 1)).and_then(|v| v.as_f64()).unwrap_or(0.0) / 2.0;
+            }
+            let mut best = 0usize;
+            for i in 1..n {
+                if sums[i] > sums[best] {
+                    best = i;
+                }
+            }
+            let cost = match (c1, c2) {
+                (Some(a), Some(b)) => Some(a + b),
+                _ => None,
+            };
+            (
+                j1,
+                cost,
+                format!("image {}", best + 1),
+                imgs.get(best).cloned().unwrap_or_default(),
+            )
+        }
+        _ => {
+            let (j, c) = send(state_for(&sent))?;
+            let ans = j
+                .pointer("/answers/answer")
+                .cloned()
+                .ok_or_else(|| NanoodleError("the decision model returned no answer".into()))?;
+            let (t, im) = match mode {
+                "choose" => (
+                    ans.get("choice").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    imgs.first().cloned().unwrap_or_default(),
+                ),
+                "score" => {
+                    let sc = ans.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0) + 1.0;
+                    let rounded = (sc * 100.0).round() / 100.0;
+                    let t = if rounded == rounded.trunc() {
+                        format!("{}", rounded as i64)
+                    } else {
+                        format!("{}", rounded)
+                    };
+                    (t, imgs.first().cloned().unwrap_or_default())
+                }
+                _ => {
+                    // yesno
+                    let py = ans.get("noul").and_then(|v| v.as_f64()).unwrap_or(0.0).clamp(0.0, 1.0);
+                    let t = if py >= 0.5 { "yes" } else { "no" }.to_string();
+                    let mut out = Map::new();
+                    out.insert("text".into(), json!(t));
+                    out.insert("image".into(), json!(imgs.first().cloned().unwrap_or_default()));
+                    let gate = matches!(node.fields.get("gate"), Some(Value::Bool(true)))
+                        || node.field_str("gate").as_deref() == Some("true");
+                    if gate && py < 0.5 {
+                        return Ok(NodeOutcome::Gated(out, c));
+                    }
+                    return Ok(NodeOutcome::Done(out, c));
+                }
+            };
+            (j, c, t, im)
+        }
+    };
+    let _ = ans;
+    let mut out = Map::new();
+    out.insert("text".into(), json!(out_text));
+    out.insert("image".into(), json!(out_image));
+    Ok(NodeOutcome::Done(out, cost))
+}
+
+// ---- image family (POST /v1/images/generations — note: not /api/v1)
+
+fn b64_image_mime(b64: &str) -> &'static str {
+    // tiny base64 prefix sniff (JS b64ImageMime): decode the first bytes' worth.
+    let head: String = b64.chars().take(24).collect();
+    let mut bytes = Vec::new();
+    let mut acc: u32 = 0;
+    let mut nbits = 0;
+    for c in head.bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => break,
+        };
+        acc = (acc << 6) | v as u32;
+        nbits += 6;
+        if nbits >= 8 {
+            nbits -= 8;
+            bytes.push((acc >> nbits) as u8);
+        }
+        if bytes.len() >= 12 {
+            break;
+        }
+    }
+    if bytes.starts_with(&[0x89, 0x50, 0x4E, 0x47]) {
+        "image/png"
+    } else if bytes.starts_with(&[0xFF, 0xD8]) {
+        "image/jpeg"
+    } else if bytes.starts_with(b"GIF") {
+        "image/gif"
+    } else if bytes.starts_with(b"RIFF") && bytes.len() >= 12 && &bytes[8..12] == b"WEBP" {
+        "image/webp"
+    } else {
+        "image/png"
+    }
+}
+
+/// fields.modelOpts passthrough + numeric seed (JS imgExtra, minus the
+/// custom-civitai AIR handling — deferred, noted in RUST-BRIEF slice notes).
+fn img_extra(node: &Node) -> Map<String, Value> {
+    let mut e = Map::new();
+    if let Some(Value::Object(mo)) = node.fields.get("modelOpts") {
+        for (k, v) in mo {
+            e.insert(k.clone(), v.clone());
+        }
+    }
+    if let Some(s) = node.fields.get("seed") {
+        match s {
+            Value::Number(n) => {
+                e.insert("seed".into(), json!(n));
+            }
+            Value::String(s) if !s.trim().is_empty() => {
+                if let Ok(n) = s.trim().parse::<f64>() {
+                    e.insert("seed".into(), json!(n));
+                }
+            }
+            _ => {}
+        }
+    }
+    e
+}
+
+fn gen_image(
+    ctx: &Ctx,
+    model: &str,
+    prompt: Option<&str>,
+    size: &str,
+    image_data_url: Option<Value>,
+    mask_data_url: Option<&str>,
+    extra: Map<String, Value>,
+    n: i64,
+) -> Result<(Vec<String>, Option<f64>)> {
+    let mut body = Map::new();
+    body.insert("model".into(), json!(model));
+    body.insert("size".into(), json!(if size.is_empty() { "1024x1024" } else { size }));
+    body.insert("n".into(), json!(n));
+    body.insert("response_format".into(), json!("b64_json"));
+    if let Some(p) = prompt {
+        if !p.is_empty() {
+            body.insert("prompt".into(), json!(p));
+        }
+    }
+    if let Some(u) = image_data_url {
+        body.insert("imageDataUrl".into(), u);
+    }
+    if let Some(m) = mask_data_url {
+        body.insert("maskDataUrl".into(), json!(m));
+    }
+    for (k, v) in extra {
+        body.insert(k, v);
+    }
+    let (j, cost) = ctx.post_json("/v1/images/generations", &Value::Object(body))?;
+    let mut urls = Vec::new();
+    if let Some(data) = j.get("data").and_then(|d| d.as_array()) {
+        for d in data {
+            if let Some(b) = d.get("b64_json").and_then(|v| v.as_str()) {
+                urls.push(format!("data:{};base64,{}", b64_image_mime(b), b));
+            } else if let Some(u) = d.get("url").and_then(|v| v.as_str()) {
+                urls.push(u.to_string());
+            }
+        }
+    }
+    if urls.is_empty() {
+        return Err(NanoodleError("no image in response".into()));
+    }
+    Ok((urls, cost))
+}
+
+/// JS promptOf: a wired prompt wins over the field EVEN when empty (no
+/// fallback), the result is trimmed, and empty-after-trim is "no prompt"
+/// (None here; throwing runners map it to their error).
+pub fn prompt_of(node: &Node, inputs: &HashMap<String, Value>) -> Option<String> {
+    let raw = match inputs.get("prompt") {
+        Some(v) if !v.is_null() => value_text(v),
+        _ => match node.fields.get("prompt") {
+            Some(v) if !v.is_null() => value_text(v),
+            _ => return None,
+        },
+    };
+    let p = raw.trim().to_string();
+    if p.is_empty() {
+        None
+    } else {
+        Some(p)
+    }
+}
+
+/// edit reference ports: image, image2, image3, … in that order (EDIT_IMG_RE).
+fn collect_edit_ports(inputs: &HashMap<String, Value>) -> Vec<String> {
+    let mut ports: Vec<(u32, &String)> = Vec::new();
+    for (k, v) in inputs.iter() {
+        let ord = if k == "image" {
+            Some(1)
+        } else if let Some(rest) = k.strip_prefix("image") {
+            if !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()) {
+                rest.parse::<u32>().ok()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let (Some(o), Value::String(s)) = (ord, v) {
+            if !s.is_empty() {
+                ports.push((o, s));
+            }
+        }
+    }
+    ports.sort_by_key(|(o, _)| *o);
+    ports.into_iter().map(|(_, s)| s.clone()).collect()
+}
+
+fn run_image(
+    node: &Node,
+    inputs: &HashMap<String, Value>,
+    ctx: &Ctx,
+) -> Result<NodeOutcome> {
+    let prompt = prompt_of(node, inputs)
+        .ok_or_else(|| NanoodleError("no prompt".into()))?;
+    let want: i64 = node
+        .field_str("variations")
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(1)
+        .max(1);
+    let size = node.field_str("size").unwrap_or_default();
+    let (urls, cost) = gen_image(
+        ctx,
+        &mdl(node)?,
+        Some(&prompt),
+        &size,
+        None,
+        None,
+        img_extra(node),
+        want,
+    )?;
+    let sel = node
+        .field_str("sel")
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0)
+        .min(urls.len() - 1);
+    let mut out = Map::new();
+    out.insert("image".into(), json!(urls[sel]));
+    out.insert("images".into(), json!(urls));
+    Ok(NodeOutcome::Done(out, cost))
+}
+
+fn run_edit(
+    node: &Node,
+    inputs: &HashMap<String, Value>,
+    ctx: &Ctx,
+) -> Result<NodeOutcome> {
+    let imgs = collect_edit_ports(inputs);
+    if imgs.is_empty() {
+        return Err(NanoodleError("no image input".into()));
+    }
+    let prompt = prompt_of(node, inputs).unwrap_or_default();
+    if prompt.is_empty() {
+        return Err(NanoodleError("no edit instruction".into()));
+    }
+    let src = if imgs.len() > 1 {
+        json!(imgs)
+    } else {
+        json!(imgs[0])
+    };
+    let size = node.field_str("size").unwrap_or_default();
+    let (urls, cost) = gen_image(
+        ctx,
+        &mdl(node)?,
+        Some(&prompt),
+        &size,
+        Some(src),
+        None,
+        img_extra(node),
+        1,
+    )?;
+    let mut out = Map::new();
+    out.insert("image".into(), json!(urls[0]));
+    Ok(NodeOutcome::Done(out, cost))
+}
+
+fn run_local_node(
+    node: &Node,
+    inputs: &HashMap<String, Value>,
+) -> std::result::Result<Map<String, Value>, NanoodleError> {
+    let mut out = Map::new();
+    match node.ty.as_str() {
+        "text" => {
+            out.insert("text".into(), json!(node.field_str("text").unwrap_or_default()));
+        }
+        "upload" | "aupload" | "vupload" | "mupload" => {
+            let (key, label) = match node.ty.as_str() {
+                "upload" => ("image", "no image — this Image input has no image"),
+                "aupload" => ("audio", "no audio — this Audio input has no clip"),
+                "vupload" => ("video", "no video — this Video input has no clip"),
+                _ => ("model", "no 3D file — drop a .glb first"),
+            };
+            let v = node.field_str(key).unwrap_or_default();
+            if v.is_empty() {
+                if node.optional() {
+                    out.insert(key.into(), json!(""));
+                } else {
+                    return Err(NanoodleError(label.into()));
+                }
+            } else {
+                out.insert(key.into(), json!(v));
+            }
+        }
+        "choice" => {
+            let opts: Vec<String> = node
+                .field_str("options")
+                .unwrap_or_default()
+                .split('\n')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            let sel = node.field_str("selected");
+            let val = match &sel {
+                Some(s) if opts.iter().any(|o| o == s) => s.clone(),
+                _ => opts.first().cloned().unwrap_or_default(),
+            };
+            if val.is_empty() {
+                return Err(NanoodleError("no options — this Choice has no options to pick from".into()));
+            }
+            out.insert("text".into(), json!(val));
+        }
+        "join" => {
+            let sep_raw = node.field_str("sep").unwrap_or_else(|| " ".to_string());
+            let sep = sep_raw.replace("\\n", "\n");
+            let parts: Vec<String> = ["a", "b"]
+                .iter()
+                .filter_map(|p| inputs.get(*p))
+                .map(value_text)
+                .filter(|s| !s.is_empty())
+                .collect();
+            out.insert("text".into(), json!(parts.join(&sep)));
+        }
+        other => {
+            return Err(NanoodleError(format!(
+                "node type '{}' is not implemented in nanoodle-rs slice 1",
+                other
+            )));
+        }
+    }
+    Ok(out)
+}
+
+/// What a node's step needs, gathered from the run state under a brief lock:
+/// the scheduler hands this to a worker, which executes it lock-free.
+enum Gathered {
+    /// comment nodes never run.
+    Comment,
+    /// A direct upstream errored: this node errors too, naming it
+    /// (JS/Py "upstream failed: X" — it cascades down the chain).
+    UpstreamFailed(String),
+    /// Every inbound wire comes from an onError:"skip" node that failed:
+    /// JS errors "all inputs were skipped after failing: X, Y".
+    AllSkipped(String),
+    /// An upstream gated shut (or was gate-skipped): skipped, unbilled.
+    Blocked,
+    /// Inputs + the effective node (field overrides applied).
+    Ready { node: Node, inputs: HashMap<String, Value> },
+}
+
+/// Gather a node's inputs + field overrides from links (JS: every wired
+/// value is visible in `inp`; non-input ports additionally override the
+/// field). Only the single wired Value is cloned per link.
+fn gather_step(
+    node: &Node,
+    graph: &Graph,
+    outputs_by_node: &HashMap<String, Map<String, Value>>,
+    records: &HashMap<String, NodeRecord>,
+) -> Gathered {
+    if node.ty == "comment" {
+        return Gathered::Comment;
+    }
+    let mut inputs: HashMap<String, Value> = HashMap::new();
+    let mut effective: Option<Node> = None;
+    let mut failed: Option<String> = None;
+    let mut skipped_err: Vec<String> = Vec::new();
+    let mut gate_blocked = false;
+    let mut inbound = 0usize;
+    for l in graph.links.iter().filter(|l| l.to_node == node.id) {
+        inbound += 1;
+        if let Some(rec) = records.get(&l.from_node) {
+            // display name only matters for failure bookkeeping — stay lazy
+            // on the hot path (every link of every node passes through here)
+            let src_name = || {
+                graph
+                    .nodes
+                    .iter()
+                    .find(|n| n.id == l.from_node)
+                    .map(|n| n.display_name())
+                    .unwrap_or_else(|| l.from_node.clone())
+            };
+            match rec.status.as_str() {
+                // a real failure upstream wins over a gate (JS workflow.mjs)
+                "error" => {
+                    if failed.is_none() {
+                        failed = Some(src_name());
+                    }
+                }
+                // onError:"skip" records carry their error under "skipped"
+                "skipped" if rec.error.is_some() => {
+                    let name = src_name();
+                    if !skipped_err.contains(&name) {
+                        skipped_err.push(name);
+                    }
+                }
+                "skipped" | "gated" => gate_blocked = true,
+                _ => {}
+            }
+        }
+        let v = outputs_by_node
+            .get(&l.from_node)
+            .and_then(|m| m.get(&l.from_port))
+            .cloned()
+            .unwrap_or(Value::Null);
+        inputs.insert(l.to_port.clone(), v.clone());
+        if !is_input_port(node, &l.to_port) {
+            effective
+                .get_or_insert_with(|| node.clone())
+                .fields
+                .insert(l.to_port.clone(), v);
+        }
+    }
+    if let Some(name) = failed {
+        return Gathered::UpstreamFailed(name);
+    }
+    if inbound > 0 && skipped_err.len() > 0 {
+        let skipped_sources = graph
+            .links
+            .iter()
+            .filter(|l| l.to_node == node.id)
+            .filter(|l| {
+                records
+                    .get(&l.from_node)
+                    .map(|r| r.status == "skipped" && r.error.is_some())
+                    .unwrap_or(false)
+            })
+            .count();
+        if skipped_sources == inbound {
+            return Gathered::AllSkipped(skipped_err.join(", "));
+        }
+    }
+    if gate_blocked {
+        return Gathered::Blocked;
+    }
+    Gathered::Ready {
+        node: effective.unwrap_or_else(|| node.clone()),
+        inputs,
+    }
+}
+
+/// Execute a gathered step: returns (record, out, blocks_downstream, error).
+fn execute_step(g: Gathered, ctx: &Ctx) -> (NodeRecord, Map<String, Value>, bool, Option<String>) {
+    match g {
+        Gathered::Comment => (
+            NodeRecord { status: "skipped".into(), out: Map::new(), error: None, cost: None },
+            Map::new(),
+            false,
+            None,
+        ),
+        Gathered::Blocked => (
+            NodeRecord { status: "skipped".into(), out: Map::new(), error: None, cost: None },
+            Map::new(),
+            true,
+            None,
+        ),
+        Gathered::UpstreamFailed(name) => {
+            let msg = format!("upstream failed: {}", name);
+            (
+                NodeRecord { status: "error".into(), out: Map::new(), error: Some(msg.clone()), cost: None },
+                Map::new(),
+                true,
+                Some(msg),
+            )
+        }
+        Gathered::AllSkipped(names) => {
+            let msg = format!("all inputs were skipped after failing: {}", names);
+            (
+                NodeRecord { status: "error".into(), out: Map::new(), error: Some(msg.clone()), cost: None },
+                Map::new(),
+                true,
+                Some(msg),
+            )
+        }
+        Gathered::Ready { node, inputs } => match run_node(&node, &inputs, ctx) {
+            Ok(NodeOutcome::Done(out, cost)) => (
+                NodeRecord { status: "done".into(), out: out.clone(), error: None, cost },
+                out,
+                false,
+                None,
+            ),
+            Ok(NodeOutcome::Gated(out, cost)) => (
+                NodeRecord { status: "gated".into(), out: out.clone(), error: None, cost },
+                out,
+                true,
+                None,
+            ),
+            Err(e) => {
+                // fields.onError:"skip" — the failure is recorded (and counted
+                // in errors) but the node lands as skipped; dependents see
+                // empty ports and run on whatever else they have (JS).
+                if node.field_str("onError").as_deref() == Some("skip") {
+                    (
+                        NodeRecord { status: "skipped".into(), out: Map::new(), error: Some(e.message.clone()), cost: e.cost },
+                        Map::new(),
+                        false,
+                        Some(e.message),
+                    )
+                } else {
+                    (
+                        NodeRecord { status: "error".into(), out: Map::new(), error: Some(e.message.clone()), cost: e.cost },
+                        Map::new(),
+                        true,
+                        Some(e.message),
+                    )
+                }
+            }
+        },
+    }
+}
+
+/// Shared scheduler state: workers gather a ready node's inputs under the
+/// lock, execute lock-free, then record and release dependents.
+struct SchedState {
+    outputs_by_node: HashMap<String, Map<String, Value>>,
+    records: HashMap<String, NodeRecord>,
+    errors: Vec<String>,
+    cost: f64,
+    pending: HashMap<String, usize>,
+    ready: std::collections::VecDeque<String>,
+    recorded: usize,
+}
+
+/// Run a materialized graph; unknown types fail fast exactly like JS run().
+/// Scheduler: a persistent worker pool (≤32, main thread included). A node
+/// becomes ready when every node wired into it has a record, and it starts
+/// the moment a worker frees — finer-grained than wave barriers, same
+/// observable semantics (the JS engine's allSettled shape): a node only ever
+/// reads its own upstreams' final outputs, so statuses, gating and cost are
+/// identical to a sequential topo walk; only the wall clock changes.
+/// JS io.mjs uniqueKey: first free of base, "base 2", "base 3", … compared
+/// case-insensitively against used keys and a reserved set (for outputs: the
+/// other sinks' node ids, so a display name can never shadow an id key).
+/// `reserved` holds ALL sinks' ids and `res_exempt` is the current sink's
+/// own id — exempting it inline keeps this O(1) per check instead of
+/// rebuilding a per-sink set (which made the epilogue O(sinks^2)).
+/// `hints` caches the next suffix to try per base: keys are only ever
+/// added to `used` and `reserved` is fixed during a derivation, so every
+/// suffix below the hint is still blocked — probing from the hint finds
+/// exactly the key a from-2 probe would, in amortized O(1). (Without it,
+/// N same-named sinks cost O(N^2) probes: "Join", "Join 2", … "Join N".)
+fn unique_key(
+    base: &str,
+    used: &mut HashSet<String>,
+    reserved: &HashSet<String>,
+    res_exempt: &str,
+    hints: &mut HashMap<String, usize>,
+) -> String {
+    // Probe order mirrors JS exactly: base, then "base 2", "base 3", …
+    // The hint only skips probes that are provably still blocked: a
+    // suffixed key was handed out before (hint > 2) only after the base
+    // itself was found blocked, and blocked keys never free up.
+    let mut suffix = hints.get(base).copied().unwrap_or(2).max(2);
+    let mut key = if suffix > 2 {
+        format!("{} {}", base, suffix)
+    } else {
+        base.to_string()
+    };
+    loop {
+        let lk = key.to_lowercase();
+        let blocked = used.contains(&lk) || (lk != res_exempt && reserved.contains(&lk));
+        if !blocked {
+            break;
+        }
+        key = format!("{} {}", base, suffix);
+        suffix += 1;
+    }
+    used.insert(key.to_lowercase());
+    hints.insert(base.to_string(), suffix);
+    key
+}
+
+/// One derived user input (JS io.mjs deriveInputs).
+struct InputEntry {
+    key: String,
+    node_id: String,
+    field: String,
+    optional: bool,
+    def: Option<Value>,
+}
+
+/// (field, label, optional, spec default) per type — JS INPUT_SPECS.
+fn input_specs(ty: &str) -> &'static [(&'static str, &'static str, bool, Option<&'static str>)] {
+    match ty {
+        "text" => &[("text", "Text", false, None)],
+        "upload" => &[("image", "Image", false, None)],
+        "aupload" => &[("audio", "Audio", false, None)],
+        "vupload" => &[("video", "Video", false, None)],
+        "mupload" => &[("model", "3D file", false, None)],
+        "llm" => &[
+            ("prompt", "Prompt", false, None),
+            ("system", "System prompt", true, Some("You are a helpful, concise assistant.")),
+        ],
+        "image" => &[("prompt", "Image prompt", false, None)],
+        "tvideo" => &[("prompt", "Video prompt", false, None)],
+        "music" => &[("prompt", "Style / prompt", false, None)],
+        "remix" => &[("prompt", "Style / direction", false, None)],
+        "tts" => &[("prompt", "Text to speak", false, None)],
+        "model3d" => &[("prompt", "3D prompt", true, None)],
+        "endpoint" => &[("prompt", "Prompt", false, None)],
+        _ => &[],
+    }
+}
+
+fn flag_is_true(v: Option<&Value>) -> bool {
+    match v {
+        Some(Value::Bool(true)) => true,
+        Some(Value::String(s)) => s == "true",
+        _ => false,
+    }
+}
+
+/// JS io.mjs deriveInputs: INPUT_SPECS fields not fed by a wire, plus the
+/// inpaint / choice special cases, each with a unique friendly key.
+fn derive_inputs(graph: &Graph) -> Vec<InputEntry> {
+    let fed = |id: &str, port: &str| {
+        graph.links.iter().any(|l| l.to_node == id && l.to_port == port)
+    };
+    struct Raw {
+        node_id: String,
+        field: String,
+        label: String,
+        optional: bool,
+        def: Option<Value>,
+    }
+    let mut raw: Vec<Raw> = Vec::new();
+    let mut mk = |raw: &mut Vec<Raw>, n: &Node, field: &str, label: &str, optional: bool, spec_def: Option<&str>| {
+        let cur = n.fields.get(field);
+        let def = match cur {
+            Some(v) if !matches!(v, Value::Null) && !(matches!(v, Value::String(s) if s.is_empty())) => Some(v.clone()),
+            _ => spec_def.map(|s| Value::String(s.to_string())),
+        };
+        raw.push(Raw {
+            node_id: n.id.clone(),
+            field: field.to_string(),
+            label: label.to_string(),
+            optional: optional || flag_is_true(n.fields.get("optional")),
+            def,
+        });
+    };
+    for n in &graph.nodes {
+        if n.unknown || flag_is_true(n.fields.get("locked")) {
+            continue;
+        }
+        if n.ty == "inpaint" {
+            if !fed(&n.id, "prompt") {
+                mk(&mut raw, n, "prompt", "What to paint in", false, None);
+            }
+            let img_fed = fed(&n.id, "image");
+            let mask_fed = fed(&n.id, "mask");
+            if !img_fed {
+                mk(&mut raw, n, "image", if mask_fed { "Image" } else { "Image — the picture to repaint" }, false, None);
+            }
+            if !mask_fed {
+                mk(&mut raw, n, "mask", "Mask (white = repaint)", false, None);
+            }
+            continue;
+        }
+        if n.ty == "choice" {
+            let options: Vec<String> = n
+                .field_str("options")
+                .unwrap_or_default()
+                .split('\n')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            let before = raw.len();
+            mk(&mut raw, n, "selected", "Choice", false, None);
+            let e = &mut raw[before];
+            let def_ok = matches!(&e.def, Some(Value::String(s)) if options.contains(s));
+            if !def_ok {
+                e.def = options.first().map(|s| Value::String(s.clone()));
+            }
+            continue;
+        }
+        for (field, label, optional, spec_def) in input_specs(&n.ty) {
+            if !fed(&n.id, field) {
+                mk(&mut raw, n, field, label, *optional, *spec_def);
+            }
+        }
+    }
+    // Friendly keys: the node's custom name labels its input when it
+    // contributes exactly one required input, or exactly one input at all.
+    // Aggregates are precomputed in one pass — a per-entry rescan of `raw`
+    // made this O(entries^2), which dominated wide graphs.
+    let mut counts: HashMap<&str, (usize, usize, Option<&str>)> = HashMap::new();
+    for e in &raw {
+        let c = counts.entry(e.node_id.as_str()).or_insert((0, 0, None));
+        c.0 += 1;
+        if !e.optional {
+            c.1 += 1;
+            c.2 = Some(e.field.as_str());
+        }
+    }
+    let names: HashMap<&str, &str> = graph
+        .nodes
+        .iter()
+        .map(|n| (n.id.as_str(), n.name.as_deref().unwrap_or("")))
+        .collect();
+    let mut used: HashSet<String> = HashSet::new();
+    let mut key_hints: HashMap<String, usize> = HashMap::new();
+    let mut entries = Vec::new();
+    for e in &raw {
+        let (total, req, req_field) = counts[e.node_id.as_str()];
+        let names_it = (req == 1 && req_field == Some(e.field.as_str()))
+            || (req == 0 && total == 1);
+        let custom = names.get(e.node_id.as_str()).copied().unwrap_or("");
+        let base = if !custom.trim().is_empty() && names_it { custom.trim().to_string() } else { e.label.clone() };
+        let key = unique_key(&base, &mut used, &HashSet::new(), "", &mut key_hints);
+        entries.push(InputEntry {
+            key,
+            node_id: e.node_id.clone(),
+            field: e.field.clone(),
+            optional: e.optional,
+            def: e.def.clone(),
+        });
+    }
+    entries
+}
+
+pub fn run(graph: &Graph, ctx: &Ctx) -> std::result::Result<RunResult, RunFailure> {
+    if let Some(n) = graph.nodes.iter().find(|n| n.unknown) {
+        return Err(NanoodleError(format!(
+            "node {}: unknown node type '{}' — this graph needs a newer nanoodle library",
+            n.id, n.ty
+        ))
+        .into());
+    }
+    let order = topo_sort(graph)?; // cycle check (names the cyclic nodes)
+    let by_id: HashMap<&str, &Node> = graph.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
+    let total = graph.nodes.len();
+
+    // Required-input validation (JS workflow.run): a derived input whose
+    // field is empty and has no default fails the run before anything runs.
+    // (No caller inputs in this entry point — explicit set is empty, and
+    // field/default backfill is already mirrored inside the node runners.)
+    for e in derive_inputs(graph) {
+        if e.optional {
+            continue;
+        }
+        let v = by_id[e.node_id.as_str()].fields.get(&e.field);
+        let empty = match v {
+            None | Some(Value::Null) => true,
+            Some(Value::String(s)) => s.trim().is_empty(),
+            Some(_) => false,
+        };
+        if !empty {
+            continue;
+        }
+        let def_fills = matches!(&e.def, Some(Value::String(s)) if !s.is_empty())
+            || matches!(&e.def, Some(x) if !matches!(x, Value::Null));
+        if !def_fills {
+            return Err(NanoodleError(format!(
+                "missing required input \"{}\" ({}.{})",
+                e.key, e.node_id, e.field
+            ))
+            .into());
+        }
+    }
+
+    // Readiness bookkeeping: count each node's distinct upstream nodes once;
+    // a node becomes ready when that count drains to zero. (The first cut
+    // rescanned nodes × links on every wave — O(waves · nodes · links), which
+    // made a 500-node local chain cost ~200 ms of pure scheduling.)
+    let mut pending: HashMap<String, usize> =
+        graph.nodes.iter().map(|n| (n.id.clone(), 0)).collect();
+    let mut dependents: HashMap<String, Vec<String>> = HashMap::new();
+    {
+        let mut seen: HashSet<(&str, &str)> = HashSet::new();
+        for l in &graph.links {
+            if seen.insert((l.from_node.as_str(), l.to_node.as_str())) {
+                if let Some(p) = pending.get_mut(&l.to_node) {
+                    *p += 1;
+                }
+                dependents
+                    .entry(l.from_node.clone())
+                    .or_default()
+                    .push(l.to_node.clone());
+            }
+        }
+    }
+    let ready: std::collections::VecDeque<String> = graph
+        .nodes
+        .iter()
+        .filter(|n| pending[&n.id] == 0)
+        .map(|n| n.id.clone())
+        .collect();
+
+    let state = std::sync::Mutex::new(SchedState {
+        outputs_by_node: HashMap::new(),
+        records: HashMap::new(),
+        errors: Vec::new(),
+        cost: 0.0,
+        pending,
+        ready,
+        recorded: 0,
+    });
+    let cvar = std::sync::Condvar::new();
+    let dependents_ref = &dependents;
+    let by_id_ref = &by_id;
+    let state_ref = &state;
+    let cvar_ref = &cvar;
+    let worker = move || loop {
+        let (id, gathered) = {
+            let mut st = state_ref.lock().unwrap();
+            loop {
+                if st.recorded == total {
+                    return;
+                }
+                if let Some(id) = st.ready.pop_front() {
+                    let g = gather_step(by_id_ref[id.as_str()], graph, &st.outputs_by_node, &st.records);
+                    break (id, g);
+                }
+                st = cvar_ref.wait(st).unwrap();
+            }
+        };
+        let (rec, out, is_blocked, err) = execute_step(gathered, ctx);
+        let (released, finished) = {
+            let mut st = state_ref.lock().unwrap();
+            if let Some(c) = rec.cost {
+                st.cost += c;
+            }
+            if let Some(e) = err {
+                st.errors.push(format!("node {}: {}", id, e));
+            }
+            let _ = is_blocked; // downstream semantics now derive from records in gather_step
+            st.outputs_by_node.insert(id.clone(), out);
+            st.records.insert(id.clone(), rec);
+            st.recorded += 1;
+            let mut released = 0usize;
+            if let Some(deps) = dependents_ref.get(&id) {
+                for d in deps {
+                    if let Some(p) = st.pending.get_mut(d) {
+                        *p -= 1;
+                        if *p == 0 {
+                            st.ready.push_back(d.clone());
+                            released += 1;
+                        }
+                    }
+                }
+            }
+            (released, st.recorded == total)
+        };
+        // Wake one waiter per newly-ready node (notify_all on every record
+        // made chains pay a 32-thread thundering herd per step); the final
+        // record wakes everyone so they can exit.
+        if finished {
+            cvar_ref.notify_all();
+        } else {
+            for _ in 0..released {
+                cvar_ref.notify_one();
+            }
+        }
+    };
+
+    const MAX_PARALLEL: usize = 32;
+    let workers = MAX_PARALLEL.min(total).max(1);
+    if workers <= 1 {
+        worker();
+    } else {
+        std::thread::scope(|s| {
+            for _ in 1..workers {
+                s.spawn(worker);
+            }
+            worker();
+        });
+    }
+
+    let st = state.into_inner().unwrap();
+    let mut result = RunResult::default();
+    result.nodes = st.records;
+    result.errors = st.errors;
+    result.cost_usd = st.cost;
+
+    let has_outgoing: HashSet<&str> = graph.links.iter().map(|l| l.from_node.as_str()).collect();
+
+    // outputs: sink nodes (no outgoing links, type has outputs) keyed by
+    // display name AND node id, primary output port only. Keys are assigned
+    // for ALL sinks in topo order (JS deriveOutputs) — a sink that errored
+    // still consumes its key, so a surviving same-named sink keeps its
+    // suffixed key — and only sinks that produced the port emit a value.
+    let sinks: Vec<&Node> = order
+        .iter()
+        .map(|id| by_id[id.as_str()])
+        .filter(|n| {
+            !has_outgoing.contains(n.id.as_str())
+                && !node_type(&n.ty).map(|t| t.2.is_empty()).unwrap_or(true)
+        })
+        .collect();
+    let sink_ids: HashSet<String> = sinks.iter().map(|n| n.id.to_lowercase()).collect();
+    let mut used: HashSet<String> = HashSet::new();
+    let mut key_hints: HashMap<String, usize> = HashMap::new();
+    for n in &sinks {
+        let key = unique_key(&n.display_name(), &mut used, &sink_ids, &n.id.to_lowercase(), &mut key_hints);
+        let rec = match result.nodes.get(&n.id) {
+            Some(r) if r.status == "done" || (r.status == "gated" && !r.out.is_empty()) => r,
+            _ => continue,
+        };
+        let (_, _, ports) = node_type(&n.ty).unwrap_or(("", &[], &[]));
+        if let Some(v) = rec.out.get(ports[0]) {
+            result.outputs.insert(key, v.clone());
+            result.outputs.insert(n.id.clone(), v.clone());
+        }
+    }
+
+    // JS run() throws RunError when any sink (output) node errored — the
+    // error CARRIES the result (records, outputs, cost), like JS/Py.
+    // Non-sink errors are collected in result.errors and never throw.
+    // (The JS "every output skipped after failing" branch needs
+    // onError:"skip" settings, which this engine does not take yet.)
+    for n in &graph.nodes {
+        if has_outgoing.contains(n.id.as_str()) || n.ty == "comment" {
+            continue;
+        }
+        if let Some(rec) = result.nodes.get(&n.id) {
+            if rec.status == "error" {
+                return Err(RunFailure {
+                    message: format!(
+                        "run failed — \"{}\": {}",
+                        n.display_name(),
+                        rec.error.clone().unwrap_or_default()
+                    ),
+                    result: Some(result),
+                });
+            }
+        }
+    }
+    Ok(result)
+}

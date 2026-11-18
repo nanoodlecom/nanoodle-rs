@@ -1,0 +1,16 @@
+[package]
+name = "nanoodle-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Rust executor for nanoodle graphs — same frozen format, conformance-suite proven"
+license = "MIT"
+
+[dependencies]
+serde_json = "1"
+ureq = { version = "3", features = ["rustls", "json"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
