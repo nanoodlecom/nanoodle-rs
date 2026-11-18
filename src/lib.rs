@@ -723,8 +723,14 @@ fn chat(
     response_format: bool,
     reasoning_effort: Option<&str>,
     show_thinking: bool,
+    max_tokens: Option<i64>,
 ) -> Result<(String, Option<f64>)> {
     let mut body = json!({ "model": model, "messages": messages });
+    // max_tokens only when the caller explicitly opted in (D1 ruling:
+    // default-off, honored exactly when set — mirrors JS llmOpts / Py _run_llm).
+    if let Some(mt) = max_tokens {
+        body["max_tokens"] = json!(mt);
+    }
     if model != "google/gemini-4-carbon" {
         body["temperature"] = json!(temperature.unwrap_or(0.8));
     }
@@ -792,7 +798,15 @@ fn run_llm(
     let effort = effort.as_deref().filter(|e| !e.is_empty() && *e != "default");
     let show_thinking = matches!(node.fields.get("showThinking"), Some(Value::Bool(true)))
         || node.field_str("showThinking").as_deref() == Some("true");
-    // NOTE: no max_tokens — follows the JS SDK (divergence D1, undecided).
+    // D1 ruling (2026-11-18): maxTokens opt-in — truthy + numeric field →
+    // max_tokens = trunc(+v); absent/non-numeric → nothing sent.
+    let max_tokens = match node.fields.get("maxTokens") {
+        Some(Value::String(s)) if !s.is_empty() => {
+            s.parse::<f64>().ok().map(|v| v.trunc() as i64)
+        }
+        Some(Value::Number(n)) => n.as_f64().filter(|v| *v != 0.0).map(|v| v.trunc() as i64),
+        _ => None,
+    };
     let (text, cost) = chat(
         ctx,
         Value::Array(messages),
@@ -801,6 +815,7 @@ fn run_llm(
         response_format,
         effort,
         show_thinking,
+        max_tokens,
     )?;
     let mut out = Map::new();
     out.insert("text".into(), json!(text));
@@ -823,7 +838,7 @@ fn run_vision(
             { "type": "image_url", "image_url": { "url": img } }
         ]
     }]);
-    let (text, cost) = chat(ctx, messages, &mdl(node)?, None, false, None, false)?;
+    let (text, cost) = chat(ctx, messages, &mdl(node)?, None, false, None, false, None)?;
     let mut out = Map::new();
     out.insert("text".into(), json!(text));
     Ok(NodeOutcome::Done(out, cost))
