@@ -1,6 +1,6 @@
 [package]
 name = "nanoodle"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Rust executor for nanoodle graphs — same frozen format, conformance-suite proven"
 license = "MIT"
