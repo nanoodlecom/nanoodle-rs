@@ -1,4 +1,4 @@
-use nanoodle_rs::{materialize, run, Ctx};
+use nanoodle::{materialize, run, Ctx};
 use serde_json::{json, Value};
 use std::{
     collections::{HashMap, VecDeque},

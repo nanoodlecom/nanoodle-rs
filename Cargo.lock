@@ -326,7 +326,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "nanoodle-rs"
+name = "nanoodle"
 version = "0.1.0"
 dependencies = [
  "serde_json",

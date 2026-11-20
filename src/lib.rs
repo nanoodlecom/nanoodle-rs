@@ -1,4 +1,4 @@
-//! nanoodle-rs — Rust executor for nanoodle graphs.
+//! Rust executor for nanoodle graphs.
 //!
 //! Slice 1: loader (materialize) + local nodes (text / choice / join / comment /
 //! upload family). Semantics mirror nanoodle-js `graph.mjs` / `nodes.mjs`

@@ -1,0 +1,104 @@
+name: Test and publish Rust crate
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  RUST_TOOLCHAIN: '1.95.0'
+
+jobs:
+  check:
+    name: Test and package
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install the Rust toolchain
+        run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+      - name: Test the crate
+        run: cargo +"$RUST_TOOLCHAIN" test --locked
+      - name: Verify the release archive
+        run: cargo +"$RUST_TOOLCHAIN" package --locked
+      - name: Check for a version bump on main
+        id: release
+        if: github.event_name == 'push' && github.repository == 'nanoodlecom/nanoodle-rs'
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          import subprocess
+          import tomllib
+
+          before = os.environ['BEFORE_SHA']
+          previous = tomllib.loads(subprocess.check_output(
+              ['git', 'show', f'{before}:Cargo.toml'], text=True
+          ))['package']
+          package = tomllib.loads(Path('Cargo.toml').read_text())['package']
+          if package['name'] != 'nanoodle':
+              raise SystemExit('Unexpected crates.io package name')
+          if package['version'] != previous['version']:
+              with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+                  print(f"version={package['version']}", file=output)
+          else:
+              print('No Cargo version change on main')
+          PY
+
+  publish:
+    name: Publish to crates.io
+    needs: check
+    if: >-
+      github.repository == 'nanoodlecom/nanoodle-rs' &&
+      github.event_name == 'push' && github.ref == 'refs/heads/main' &&
+      needs.check.outputs.version != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: crates-io
+    concurrency:
+      group: crates-io-nanoodle-${{ needs.check.outputs.version }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Check for the exact version on crates.io
+        id: registry
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          status=$(curl --silent --show-error --retry 2 --max-time 15 \
+            --user-agent 'nanoodle release workflow (https://github.com/nanoodlecom/nanoodle-rs)' \
+            --output /dev/null --write-out '%{http_code}' \
+            "https://crates.io/api/v1/crates/nanoodle/$VERSION")
+          case "$status" in
+            200) echo "nanoodle $VERSION is already published" ;;
+            404) echo 'publish=true' >> "$GITHUB_OUTPUT" ;;
+            *) echo "crates.io version lookup returned HTTP $status" >&2; exit 1 ;;
+          esac
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.registry.outputs.publish == 'true'
+        with:
+          persist-credentials: false
+      - name: Install the Rust toolchain
+        if: steps.registry.outputs.publish == 'true'
+        run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+      - uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
+        if: steps.registry.outputs.publish == 'true'
+        id: auth
+      - name: Publish the checked revision
+        if: steps.registry.outputs.publish == 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: cargo +"$RUST_TOOLCHAIN" publish --locked

@@ -5,7 +5,7 @@
 //!                                  → run report (JSON)
 //! Output shapes match the conformance suite's runner protocol.
 
-use nanoodle_rs::{materialize, run, Ctx, Graph};
+use nanoodle::{materialize, run, Ctx, Graph};
 use serde_json::{json, Map, Value};
 use std::process::ExitCode;
 
