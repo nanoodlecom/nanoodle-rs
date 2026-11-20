@@ -1203,6 +1203,21 @@ fn gen_image(
     extra: Map<String, Value>,
     n: i64,
 ) -> Result<(Vec<String>, Option<f64>)> {
+    let (urls, _layers, cost) =
+        gen_image_full(ctx, model, prompt, size, image_data_url, mask_data_url, extra, n)?;
+    Ok((urls, cost))
+}
+
+fn gen_image_full(
+    ctx: &Ctx,
+    model: &str,
+    prompt: Option<&str>,
+    size: &str,
+    image_data_url: Option<Value>,
+    mask_data_url: Option<&str>,
+    extra: Map<String, Value>,
+    n: i64,
+) -> Result<(Vec<String>, Option<Vec<Value>>, Option<f64>)> {
     let mut body = Map::new();
     body.insert("model".into(), json!(model));
     body.insert("size".into(), json!(if size.is_empty() { "1024x1024" } else { size }));
@@ -1224,19 +1239,42 @@ fn gen_image(
     }
     let (j, cost) = ctx.post_json("/v1/images/generations", &Value::Object(body))?;
     let mut urls = Vec::new();
+    let mut layers: Vec<Value> = Vec::new();
     if let Some(data) = j.get("data").and_then(|d| d.as_array()) {
         for d in data {
-            if let Some(b) = d.get("b64_json").and_then(|v| v.as_str()) {
-                urls.push(format!("data:{};base64,{}", b64_image_mime(b), b));
-            } else if let Some(u) = d.get("url").and_then(|v| v.as_str()) {
-                urls.push(u.to_string());
+            let url = if let Some(b) = d.get("b64_json").and_then(|v| v.as_str()) {
+                Some(format!("data:{};base64,{}", b64_image_mime(b), b))
+            } else {
+                d.get("url").and_then(|v| v.as_str()).map(|u| u.to_string())
+            };
+            if let Some(u) = url {
+                urls.push(u);
+                layers.push(d.get("layer").cloned().unwrap_or(Value::Null));
             }
         }
     }
     if urls.is_empty() {
         return Err(NanoodleError("no image in response".into()));
     }
-    Ok((urls, cost))
+    let layers = if layers.iter().any(|l| !l.is_null()) { Some(layers) } else { None };
+    Ok((urls, layers, cost))
+}
+
+/// The layers-aware entry point (gen_image_full): also returns the per-item
+/// `layer` metadata aligned by index with the urls (layer-decomposition
+/// models return {z_index, name, description, bounding_box} per item), or
+/// None when no item carries any.
+fn gen_image_items(
+    ctx: &Ctx,
+    model: &str,
+    prompt: Option<&str>,
+    size: &str,
+    image_data_url: Option<Value>,
+    mask_data_url: Option<&str>,
+    extra: Map<String, Value>,
+    n: i64,
+) -> Result<(Vec<String>, Option<Vec<Value>>, Option<f64>)> {
+    gen_image_full(ctx, model, prompt, size, image_data_url, mask_data_url, extra, n)
 }
 
 /// JS promptOf: a wired prompt wins over the field EVEN when empty (no
@@ -1336,7 +1374,7 @@ fn run_edit(
         json!(imgs[0])
     };
     let size = node.field_str("size").unwrap_or_default();
-    let (urls, cost) = gen_image(
+    let (urls, layers, cost) = gen_image_items(
         ctx,
         &mdl(node)?,
         Some(&prompt),
@@ -1346,9 +1384,21 @@ fn run_edit(
         img_extra(node),
         1,
     )?;
+    Ok(NodeOutcome::Done(multi_image_out(urls, layers), cost))
+}
+
+/// edit/inpaint surface EVERY returned image: `image` = the first (the
+/// standing single-output contract), `images` = all of them in response
+/// order, and `layers` = the per-item layer metadata aligned by index when
+/// any item carries it.
+pub(crate) fn multi_image_out(urls: Vec<String>, layers: Option<Vec<Value>>) -> Map<String, Value> {
     let mut out = Map::new();
     out.insert("image".into(), json!(urls[0]));
-    Ok(NodeOutcome::Done(out, cost))
+    out.insert("images".into(), json!(urls));
+    if let Some(l) = layers {
+        out.insert("layers".into(), Value::Array(l));
+    }
+    out
 }
 
 fn run_local_node(

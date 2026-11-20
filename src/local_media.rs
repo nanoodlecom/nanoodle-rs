@@ -12,7 +12,7 @@
 //! Outputs are data: URLs. Local nodes cost Some(0.0); inpaint/lipsync bill
 //! through the API like their JS twins.
 
-use crate::{input_text, mdl, prompt_of, value_text, Ctx, NanoodleError, Node, NodeError, NodeOutcome, Result};
+use crate::{input_text, mdl, multi_image_out, prompt_of, value_text, Ctx, NanoodleError, Node, NodeError, NodeOutcome, Result};
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::io::Read;
@@ -2603,13 +2603,15 @@ fn model_opts(node: &Node) -> Map<String, Value> {
 }
 
 /// The inpaint image call: same body shape as lib.rs gen_image plus the mask.
+/// Also returns the per-item `layer` metadata aligned by index with the urls
+/// (None when no item carries any; the top-level url fallback has none).
 fn gen_image_local(
     ctx: &Ctx,
     node: &Node,
     prompt: &str,
     image_data_url: Option<&str>,
     mask_data_url: Option<&str>,
-) -> Result<(Vec<String>, Option<f64>)> {
+) -> Result<(Vec<String>, Option<Vec<Value>>, Option<f64>)> {
     let model = mdl(node)?;
     let size = node.field_str("size").filter(|s| !s.is_empty()).unwrap_or_else(|| "1024x1024".to_string());
     let mut body = Map::new();
@@ -2637,18 +2639,26 @@ fn gen_image_local(
     }
     let (j, cost) = ctx.post_json("/v1/images/generations", &Value::Object(body))?;
     let mut urls: Vec<String> = Vec::new();
+    let mut layers: Vec<Value> = Vec::new();
     if let Some(data) = j.get("data").and_then(|d| d.as_array()) {
         for item in data {
+            let mut pushed = false;
             if let Some(b64) = item.get("b64_json").and_then(|v| v.as_str()) {
                 if !b64.is_empty() {
                     urls.push(format!("data:{};base64,{}", b64_image_mime(b64), b64));
-                    continue;
+                    pushed = true;
                 }
             }
-            if let Some(u) = item.get("url").and_then(|v| v.as_str()) {
-                if !u.is_empty() {
-                    urls.push(u.to_string());
+            if !pushed {
+                if let Some(u) = item.get("url").and_then(|v| v.as_str()) {
+                    if !u.is_empty() {
+                        urls.push(u.to_string());
+                        pushed = true;
+                    }
                 }
+            }
+            if pushed {
+                layers.push(item.get("layer").cloned().unwrap_or(Value::Null));
             }
         }
     }
@@ -2665,7 +2675,8 @@ fn gen_image_local(
     if urls.is_empty() {
         return Err(err("no image in response"));
     }
-    Ok((urls, cost))
+    let layers = if layers.iter().any(|l| !l.is_null()) { Some(layers) } else { None };
+    Ok((urls, layers, cost))
 }
 
 enum AudioPart {
@@ -3083,8 +3094,8 @@ pub fn run_inpaint(node: &Node, inputs: &HashMap<String, Value>, ctx: &Ctx) -> R
         .filter(|s| !s.is_empty())
         .ok_or_else(|| err("no prompt — say what to paint into the masked area"))?;
     let mask_url = mask_to_source(&mask, &source)?;
-    let (urls, cost) = gen_image_local(ctx, node, &prompt, Some(&source), Some(&mask_url))?;
-    Ok(single("image", urls.into_iter().next().unwrap_or_default(), cost))
+    let (urls, layers, cost) = gen_image_local(ctx, node, &prompt, Some(&source), Some(&mask_url))?;
+    Ok(NodeOutcome::Done(multi_image_out(urls, layers), cost))
 }
 
 fn add_costs(a: Option<f64>, b: Option<f64>) -> Option<f64> {
