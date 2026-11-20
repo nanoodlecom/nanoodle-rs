@@ -1,4 +1,4 @@
-# nanoodle-rs
+# nanoodle
 
 A Rust executor for [nanoodle](https://nanoodle.com) workflow graphs — the
 third implementation of the same frozen graph format, alongside the
@@ -13,27 +13,60 @@ Built to be a core you can put anywhere: one static binary, ~3 MB, cold
 process + graph load in ~2 ms, and a persistent worker-pool scheduler that
 runs independent nodes concurrently.
 
-## Build
+## Install
+
+Once the first release is on crates.io, install the `nanoodle-rs` command.
 
 ```sh
-cargo build --release
-# binary: target/release/nanoodle-rs
+cargo install nanoodle --locked
 ```
 
-## Use
+You can also install the CLI directly from GitHub.
 
 ```sh
-# Load-only: parse + validate a graph, print the load report as JSON
-nanoodle-rs load graph.json
-
-# Run a graph against NanoGPT (or a compatible endpoint)
-nanoodle-rs run graph.json --api-key <key> \
-    [--base-url https://nano-gpt.com] [--catalog catalog.json]
+cargo install --git https://github.com/nanoodlecom/nanoodle-rs.git --locked
 ```
 
-Both commands print a JSON report: per-node status, outputs, cost, and
-errors. A run whose sink node fails still prints the partial report and
-reports the failure in the run error field.
+To use the library in a Rust project, add the crate once it is on crates.io.
+
+```sh
+cargo add nanoodle
+```
+
+## Run your first workflow
+
+1. Export a workflow from [Nanoodle](https://nanoodle.com) as a JSON file and
+   save it as `workflow.json`.
+2. Validate the file locally. The JSON report includes the node count and any
+   load warnings.
+
+   ```sh
+   nanoodle-rs load workflow.json
+   ```
+
+3. Run the workflow. For graphs that call hosted models, enter your
+   [NanoGPT](https://nano-gpt.com) API key when prompted.
+
+   ```bash
+   read -rsp 'NanoGPT API key: ' NANOGPT_API_KEY
+   printf '\n'
+   nanoodle-rs run workflow.json --api-key "$NANOGPT_API_KEY"
+   ```
+
+The run report includes the outputs, node statuses, cost, and errors.
+If the run fails, it includes the error and any results produced so far.
+Use `--base-url` for a compatible provider or `--catalog catalog.json` to
+supply a local model catalog.
+
+## Build from source
+
+```sh
+git clone https://github.com/nanoodlecom/nanoodle-rs.git
+cd nanoodle-rs
+cargo build --release --locked
+```
+
+The binary is at `target/release/nanoodle-rs`.
 
 ## Compatibility
 
