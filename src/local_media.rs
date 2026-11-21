@@ -813,33 +813,39 @@ fn deflate_fixed(data: &[u8]) -> Vec<u8> {
     let mut w = BitWriter::new();
     w.bits(1, 1); // BFINAL
     w.bits(1, 2); // BTYPE = fixed
-    // hash chains on 3-byte sequences
-    let mut table: HashMap<u32, Vec<usize>> = HashMap::new();
-    let key = |d: &[u8], i: usize| -> u32 {
-        ((d[i] as u32) << 16) | ((d[i + 1] as u32) << 8) | d[i + 2] as u32
+    // RFC 1951 limits distances to 32 KiB. Keep only the hash chains that
+    // can still be referenced, even when encoding a many-megabyte atlas.
+    const WINDOW: usize = 32_768;
+    const END: usize = usize::MAX;
+    let buckets = data.len().clamp(64, 65_536).next_power_of_two();
+    let mut heads = vec![END; buckets];
+    let mut previous = vec![END; data.len().min(WINDOW)];
+    let hash = |pos: usize| -> usize {
+        let key = u32::from_be_bytes([0, data[pos], data[pos + 1], data[pos + 2]]);
+        (key.wrapping_mul(0x9e37_79b1) >> (32 - buckets.trailing_zeros())) as usize
     };
     let mut i = 0usize;
     while i < data.len() {
         let mut best_len = 0usize;
         let mut best_dist = 0usize;
         if i + 2 < data.len() {
-            if let Some(cands) = table.get(&key(data, i)) {
-                for &c in cands.iter().rev().take(32) {
-                    let max_len = (data.len() - i).min(258);
-                    let mut l = 0;
-                    while l < max_len && data[c + l] == data[i + l] {
-                        l += 1;
-                    }
-                    if l > best_len {
-                        best_len = l;
-                        best_dist = i - c;
-                        if l >= 258 {
-                            break;
-                        }
-                    }
+            let max_len = (data.len() - i).min(258);
+            let mut candidate = heads[hash(i)];
+            for _ in 0..32 {
+                if candidate == END || i - candidate > WINDOW { break; }
+                let mut length = 0;
+                while length < max_len && data[candidate + length] == data[i + length] {
+                    length += 1;
                 }
+                if length > best_len {
+                    best_len = length;
+                    best_dist = i - candidate;
+                    if length == max_len { break; }
+                }
+                candidate = previous[candidate & (WINDOW - 1)];
             }
         }
+        let start = i;
         if best_len >= 4 || (best_len == 3 && i + best_len == data.len()) {
             let len = best_len;
             let mut sym_idx = 28usize;
@@ -870,19 +876,16 @@ fn deflate_fixed(data: &[u8]) -> Vec<u8> {
             if dextra > 0 {
                 w.bits((best_dist as u32 - DIST_BASE[didx]) as u32, dextra);
             }
-            for j in i..i + len {
-                if j + 2 < data.len() {
-                    table.entry(key(data, j)).or_default().push(j);
-                }
-            }
             i += len;
         } else {
             let (code, n) = fixed_lit_code(data[i] as u16);
             w.code(code, n);
-            if i + 2 < data.len() {
-                table.entry(key(data, i)).or_default().push(i);
-            }
             i += 1;
+        }
+        for pos in start..i.min(data.len().saturating_sub(2)) {
+            let bucket = hash(pos);
+            previous[pos & (WINDOW - 1)] = heads[bucket];
+            heads[bucket] = pos;
         }
     }
     let (code, n) = fixed_lit_code(256);
@@ -914,6 +917,16 @@ fn zlib_deflate(data: &[u8]) -> Vec<u8> {
     }
     out.extend_from_slice(&adler32(data).to_be_bytes());
     out
+}
+
+#[cfg(test)]
+#[test]
+fn deflate_match_outside_32k_window_reencodes_as_literals() {
+    let marker = b"sprite-atlas-row";
+    let mut pixels = marker.to_vec();
+    pixels.resize(65_536, 0);
+    pixels.extend_from_slice(marker);
+    assert_eq!(zlib_inflate(&zlib_deflate(&pixels)).unwrap(), pixels);
 }
 
 fn crc32(data: &[u8]) -> u32 {
