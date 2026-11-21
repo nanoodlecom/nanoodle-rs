@@ -57,7 +57,7 @@ supply a local model catalog.
 
 ## Sprite stacking
 
-Wire `mupload.model` to `slice-3d.model`, then `slice-3d.sheet` to `sprite-stack-render.sheet`. A static triangle GLB, self-contained glTF or uncompressed Gaussian PLY produces a transparent PNG strip, JSON layout text and a preview. The renderer takes the strip alone. It emits a PNG and an optional MP4 turntable. The crate embeds QuickJS and the shared sprite renderer. Install FFmpeg on PATH for additional image codecs and video encoding.
+Wire `mupload.model` to `slice-3d.model`, then `slice-3d.sheet` to `sprite-stack-render.sheet`. A static triangle GLB, self-contained glTF or uncompressed Gaussian PLY produces a transparent PNG strip, JSON layout text and a preview. The renderer takes the strip alone. It emits a PNG and an optional MP4 turntable. The Rust executor reads PNG, JPEG and GIF textures and palettes. Model parsing, slicing, projection, image decoding and turntable encoding run in native Rust. These two nodes need only the installed executor.
 
 ## Build from source
 
