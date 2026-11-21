@@ -286,6 +286,7 @@ mod sprite_codecs;
 mod sprite_geometry;
 mod sprite_jpeg;
 mod sprite_stack;
+mod sprite_webp;
 pub use sprite_stack::run_sprite;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);

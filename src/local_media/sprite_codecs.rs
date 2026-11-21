@@ -14,11 +14,13 @@ pub(super) fn decode_image(raw: &[u8]) -> Result<PngImage> {
         read_png(raw, true)
     } else if raw.starts_with(&[0xff, 0xd8]) {
         super::sprite_jpeg::decode_jpeg(raw)
+    } else if raw.starts_with(b"RIFF") && raw.get(8..12) == Some(b"WEBP") {
+        super::sprite_webp::decode_webp(raw)
     } else if raw.starts_with(b"GIF87a") || raw.starts_with(b"GIF89a") {
         gif::decode(raw)
     } else {
         Err(err(
-            "Unsupported sprite image format; use PNG, JPEG or GIF.",
+            "Unsupported sprite image format; use PNG, JPEG, GIF or WebP.",
         ))
     }
 }
