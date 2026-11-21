@@ -287,7 +287,7 @@ pub(in crate::local_media) fn encode_turntable(
     height: u32,
     count: u32,
     duration: f64,
-    mut frame: impl FnMut(u32) -> PngImage,
+    mut frame: impl FnMut(u32) -> Result<PngImage>,
 ) -> Result<Vec<u8>> {
     if !(2..=65534).contains(&width)
         || !(2..=65534).contains(&height)
@@ -314,7 +314,7 @@ pub(in crate::local_media) fn encode_turntable(
     let ticks = ticks as u64;
     let time = |index: u32| (u64::from(index) * ticks + u64::from(count) / 2) / u64::from(count);
     for index in 0..count {
-        let img = frame(index);
+        let img = frame(index)?;
         if img.width != width
             || img.height != height
             || img.rgba.len() != width as usize * height as usize * 4

@@ -288,6 +288,7 @@ mod sprite_geometry;
 mod sprite_jpeg;
 mod sprite_orientation;
 mod sprite_stack;
+mod sprite_sequence;
 mod sprite_webp;
 pub use sprite_stack::run_sprite;
 
@@ -967,6 +968,7 @@ fn crc32(data: &[u8]) -> u32 {
 
 // ---------------------------------------------------------------- PNG codec
 
+#[derive(Clone)]
 struct PngImage {
     width: u32,
     height: u32,

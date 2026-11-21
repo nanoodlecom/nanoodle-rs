@@ -1,7 +1,8 @@
-//! Slice static triangles and oriented Gaussian splats onto a shared world grid.
+//! Slice posed triangles and oriented Gaussian splats onto a shared world grid.
 //! The PNG strip orders square tiles from ground to top, left to right.
 use super::{
     err,
+    sprite_sequence::SequenceWriter,
     sprite_stack::{flag, number},
     PngImage,
 };
@@ -13,23 +14,26 @@ mod palette;
 mod ply;
 
 type Point = [f64; 3];
+#[derive(Clone)]
 struct Texture {
     image: Rc<PngImage>,
     wrap_s: u32,
     wrap_t: u32,
 }
+#[derive(Clone)]
 enum AlphaMode {
     Opaque,
     Mask,
     Blend,
 }
+#[derive(Clone)]
 struct Mesh {
     positions: Vec<Point>,
-    indices: Option<Vec<usize>>,
+    indices: Option<Rc<Vec<usize>>>,
     mode: u32,
-    colors: Option<Vec<[f64; 4]>>,
+    colors: Option<Rc<Vec<[f64; 4]>>>,
     color_channels: usize,
-    uvs: Option<Vec<[f64; 2]>>,
+    uvs: Option<Rc<Vec<[f64; 2]>>>,
     texture: Option<Texture>,
     factor: [f64; 4],
     alpha_mode: AlphaMode,
@@ -48,32 +52,17 @@ enum Model {
     Splat(Vec<Splat>),
 }
 
-struct Grid {
-    axis: [usize; 3],
-    sign: f64,
-    size: usize,
-    layers: usize,
+struct Bounds {
     min: Point,
     max: Point,
-    cu: f64,
-    cv: f64,
-    unit: f64,
-    step: f64,
 }
-impl Grid {
-    fn new(model: &Model, axis: &str, size: usize, layers: usize) -> Result<Self> {
-        let (axis, sign) = match axis {
-            "x" => ([1, 2, 0], -1.),
-            "y" => ([0, 2, 1], 1.),
-            "z" => ([0, 1, 2], -1.),
-            _ => return Err(err("Up axis must be auto, x, y or z.")),
-        };
-        let mut min = [f64::INFINITY; 3];
-        let mut max = [f64::NEG_INFINITY; 3];
+
+impl Bounds {
+    fn include(&mut self, model: &Model) {
         let mut grow = |p: Point| {
             for k in 0..3 {
-                min[k] = min[k].min(p[k]);
-                max[k] = max[k].max(p[k]);
+                self.min[k] = self.min[k].min(p[k]);
+                self.max[k] = self.max[k].max(p[k]);
             }
         };
         match model {
@@ -91,6 +80,30 @@ impl Grid {
                 }
             }
         }
+    }
+}
+
+struct Grid {
+    axis: [usize; 3],
+    sign: f64,
+    size: usize,
+    layers: usize,
+    min: Point,
+    max: Point,
+    cu: f64,
+    cv: f64,
+    unit: f64,
+    step: f64,
+}
+impl Grid {
+    fn new(bounds: Bounds, axis: &str, size: usize, layers: usize) -> Result<Self> {
+        let (axis, sign) = match axis {
+            "x" => ([1, 2, 0], -1.),
+            "y" => ([0, 2, 1], 1.),
+            "z" => ([0, 1, 2], -1.),
+            _ => return Err(err("Up axis must be auto, x, y or z.")),
+        };
+        let Bounds { min, max } = bounds;
         let span = (0..3).map(|k| max[k] - min[k]).fold(0., f64::max);
         if !span.is_finite() || span <= 0. {
             return Err(err("Model bounds have no usable extent."));
@@ -264,7 +277,10 @@ fn paint_mesh(grid: &Grid, meshes: &[Mesh], img: &mut PngImage) {
     let mut rays = vec![Vec::<Hit>::new(); grid.size * grid.size];
     for m in meshes {
         let points: Vec<_> = m.positions.iter().map(|&p| grid.project(p)).collect();
-        let count = m.indices.as_ref().map_or(points.len(), Vec::len);
+        let count = m
+            .indices
+            .as_ref()
+            .map_or(points.len(), |indices| indices.len());
         // A flat untextured material gives one color for every face sample.
         let solid = if m.colors.is_none() && m.texture.is_none() {
             Some(m.sample([0; 3], [1., 0., 0.]))
@@ -434,53 +450,184 @@ fn paint_splats(grid: &Grid, splats: &[Splat], img: &mut PngImage) {
     }
 }
 
+pub(super) struct SliceSettings {
+    size: usize,
+    layers: usize,
+    pub(super) colors: usize,
+    outline: bool,
+}
+
+impl SliceSettings {
+    pub(super) fn new(fields: &Map<String, Value>) -> Result<Self> {
+        let character = fields.get("preset").and_then(Value::as_str) == Some("character");
+        Ok(Self {
+            size: number(
+                fields,
+                "resolution",
+                if character { 128. } else { 48. },
+                16.,
+                128.,
+                true,
+            )? as usize,
+            layers: number(
+                fields,
+                "slices",
+                if character { 80. } else { 48. },
+                8.,
+                128.,
+                true,
+            )? as usize,
+            colors: number(
+                fields,
+                "palette",
+                if character { 0. } else { 16. },
+                0.,
+                64.,
+                true,
+            )? as usize,
+            outline: flag(fields, "outline", true),
+        })
+    }
+}
+
+fn rasterize(
+    model: &Model,
+    grid: &Grid,
+    settings: &SliceSettings,
+    palette: Option<&PngImage>,
+) -> Result<PngImage> {
+    let width = grid.size * grid.layers;
+    let mut img = PngImage {
+        width: width as u32,
+        height: grid.size as u32,
+        rgba: vec![0; width * grid.size * 4],
+    };
+    match model {
+        Model::Mesh(meshes) => paint_mesh(grid, meshes, &mut img),
+        Model::Splat(splats) => paint_splats(grid, splats, &mut img),
+    }
+    palette::finish(
+        &mut img,
+        grid.size,
+        settings.colors,
+        settings.outline,
+        palette,
+    )?;
+    Ok(img)
+}
+
+pub(super) struct Sliced {
+    pub(super) first: PngImage,
+    pub(super) animation: Option<Vec<u8>>,
+    pub(super) layout: Value,
+}
+
 pub(super) fn slice_model(
     raw: &[u8],
     fields: &Map<String, Value>,
+    settings: &SliceSettings,
     palette: Option<&PngImage>,
     decode: &dyn Fn(&[u8]) -> Result<PngImage>,
-) -> Result<(PngImage, Value)> {
-    let size = number(fields, "resolution", 48., 16., 128., true)? as usize;
-    let layers = number(fields, "slices", 48., 8., 128., true)? as usize;
-    let colors = number(fields, "palette", 16., 0., 64., true)? as usize;
-    let model = if raw.starts_with(b"ply") {
-        Model::Splat(ply::parse(raw)?)
+) -> Result<Sliced> {
+    let count = number(fields, "frames", 1., 1., 64., true)? as usize;
+    let clip = fields.get("clip").and_then(Value::as_str).unwrap_or("");
+    let (first_pose, scene, source, default_axis) = if raw.starts_with(b"ply") {
+        if count > 1 || !clip.is_empty() {
+            return Err(err(
+                "Gaussian PLY has no animation clips. Use frames=1 and leave clip blank.",
+            ));
+        }
+        (Model::Splat(ply::parse(raw)?), None, "splat", "z")
     } else {
-        Model::Mesh(gltf::parse(raw, decode)?)
-    };
-    let (source, default_axis) = match &model {
-        Model::Mesh(_) => ("mesh", "y"),
-        Model::Splat(_) => ("splat", "z"),
+        let scene = gltf::Scene::open(raw, decode, clip, count)?;
+        (Model::Mesh(scene.pose(0)?), Some(scene), "mesh", "y")
     };
     let axis = match fields.get("upAxis").and_then(Value::as_str) {
         None | Some("auto" | "") => default_axis,
         Some(axis) => axis,
     };
-    let grid = Grid::new(&model, axis, size, layers)?;
-    let width = size * layers;
-    let mut img = PngImage {
-        width: width as u32,
-        height: size as u32,
-        rgba: vec![0; width * size * 4],
+    // One bounding pass fixes the ground plane for every pose without storing the entire clip.
+    let mut bounds = Bounds {
+        min: [f64::INFINITY; 3],
+        max: [f64::NEG_INFINITY; 3],
     };
-    match model {
-        Model::Mesh(meshes) => paint_mesh(&grid, &meshes, &mut img),
-        Model::Splat(splats) => paint_splats(&grid, &splats, &mut img),
+    bounds.include(&first_pose);
+    if let Some(scene) = &scene {
+        for i in 1..count {
+            bounds.include(&Model::Mesh(scene.pose(i)?));
+        }
     }
-    palette::finish(
-        &mut img,
-        size,
-        colors,
-        flag(fields, "outline", true),
-        palette,
-    )?;
-    let layout = json!({"version":1,"order":"bottom-to-top","columns":layers,"rows":1,"tileWidth":size,"tileHeight":size,"upAxis":axis,"source":source,"bounds":{"min":grid.min,"max":grid.max},"pixelSize":grid.unit,"layerHeight":grid.step});
-    Ok((img, layout))
+    let grid = Grid::new(bounds, axis, settings.size, settings.layers)?;
+    let mut layout = json!({"version":1,"order":"bottom-to-top","columns":grid.layers,"rows":1,"tileWidth":grid.size,"tileHeight":grid.size,"upAxis":axis,"source":source,"bounds":{"min":grid.min,"max":grid.max},"pixelSize":grid.unit,"layerHeight":grid.step});
+    let first = rasterize(&first_pose, &grid, settings, palette)?;
+    drop(first_pose);
+    let animation = if count > 1 {
+        let scene = scene
+            .as_ref()
+            .ok_or_else(|| err("No animation clip. Use frames=1."))?;
+        let (name, start, duration) = scene
+            .clip()
+            .ok_or_else(|| err("No animation clip. Use frames=1."))?;
+        let times: Vec<_> = (0..count)
+            .map(|i| start + duration * i as f64 / count as f64)
+            .collect();
+        layout["animation"] = json!({"clip":name,"frames":count,"duration":duration,"times":times});
+        let mut writer = SequenceWriter::new(count, duration)?;
+        writer.push(&first)?;
+        for i in 1..count {
+            writer.push(&rasterize(
+                &Model::Mesh(scene.pose(i)?),
+                &grid,
+                settings,
+                palette,
+            )?)?;
+        }
+        Some(writer.finish()?)
+    } else {
+        None
+    };
+    Ok(Sliced {
+        first,
+        animation,
+        layout,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn character_preset_respects_explicit_and_legacy_values() {
+        let fields = json!({"preset":"character"});
+        let character = SliceSettings::new(fields.as_object().unwrap()).unwrap();
+        assert_eq!(
+            (
+                character.size,
+                character.layers,
+                character.colors,
+                character.outline
+            ),
+            (128, 80, 0, true)
+        );
+        let fields =
+            json!({"preset":"character","resolution":24,"slices":12,"palette":8,"outline":false});
+        let custom = SliceSettings::new(fields.as_object().unwrap()).unwrap();
+        assert_eq!(
+            (custom.size, custom.layers, custom.colors, custom.outline),
+            (24, 12, 8, false)
+        );
+        let original = SliceSettings::new(&Map::new()).unwrap();
+        assert_eq!(
+            (
+                original.size,
+                original.layers,
+                original.colors,
+                original.outline
+            ),
+            (48, 48, 16, true)
+        );
+    }
 
     #[test]
     fn transformed_triangle_stays_in_its_ground_tile() {
@@ -496,11 +643,19 @@ mod tests {
             "nodes":[{"translation":[3,4,5],"mesh":0}]
         }).to_string();
         let fields = json!({"resolution":16, "slices":8,"outline":true,"palette":0});
-        let (image, layout) =
-            slice_model(mesh.as_bytes(), fields.as_object().unwrap(), None, &|_| {
-                panic!("untextured primitive")
-            })
-            .unwrap();
+        let fields = fields.as_object().unwrap();
+        let Sliced {
+            first: image,
+            layout,
+            ..
+        } = slice_model(
+            mesh.as_bytes(),
+            fields,
+            &SliceSettings::new(fields).unwrap(),
+            None,
+            &|_| panic!("untextured primitive"),
+        )
+        .unwrap();
         assert_eq!((image.width, image.height), (128, 16));
         assert_eq!(layout["upAxis"], "y");
         assert_eq!(layout["bounds"]["min"][1].as_f64(), Some(4.));

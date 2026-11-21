@@ -12,7 +12,7 @@ The compiled CLI embeds the sprite renderer and runs independent nodes concurren
 
 ## Install
 
-Once the first release is on crates.io, install the `nanoodle-rs` command.
+Install the `nanoodle-rs` command from crates.io.
 
 ```sh
 cargo install nanoodle --locked
@@ -24,7 +24,7 @@ You can also install the CLI directly from GitHub.
 cargo install --git https://github.com/nanoodlecom/nanoodle-rs.git --locked
 ```
 
-To use the library in a Rust project, add the crate once it is on crates.io.
+To use the library in a Rust project, add the crate.
 
 ```sh
 cargo add nanoodle
@@ -57,7 +57,13 @@ supply a local model catalog.
 
 ## Sprite stacking
 
-Wire `mupload.model` to `slice-3d.model`, then `slice-3d.sheet` to `sprite-stack-render.sheet`. A static triangle GLB, self-contained glTF or uncompressed Gaussian PLY produces a transparent PNG strip, JSON layout text and a preview. The renderer takes the strip alone. It emits a PNG and an optional MP4 turntable. The Rust executor reads PNG, JPEG, GIF, WebP, BMP, ICO, CUR and AVIF textures and palettes. glTF materials can select WebP images with `EXT_texture_webp`. Rust handles slicing, projection and H.264 turntable encoding. The crate compiles its AVIF decoder into the executor. These two nodes need only the installed executor.
+Connect the 3D model or upload node’s `model` output to `slice-3d.model`, then connect `slice-3d.sheet` to `sprite-stack-render.sheet`. Slice 3D accepts static and rigged triangle GLB, self-contained glTF and uncompressed Gaussian PLY. With the default fields, it slices the rest pose and produces a transparent PNG strip, a preview and JSON layout.
+
+For a moving character, set `preset` to `character`, `clip` to the exact glTF animation name (for example, `Walk`), and `frames` to the number of poses (2–64). A blank clip selects the first animation when requesting multiple poses. An unnamed animation uses its one-based index, such as `Animation 1`. A named clip with `frames: 1` gives its starting pose. Every pose uses the same world bounds and ground height. The character preset supplies 128-pixel tiles, 80 layers, source colors and an outline. Individual fields override the preset.
+
+The animated sheet is an APNG that carries one complete horizontal strip per pose. The layout includes the clip name, duration and sampled times in seconds. Sprite stack render plays the sheet as an H.264 MP4 at the selected yaw and clip timing. Enable `turntable` to rotate the camera while the poses loop over the configured video duration. Its `image` port returns the first view in either mode.
+
+The Rust executor reads PNG, JPEG, GIF, WebP, BMP, ICO, CUR and AVIF textures and palettes. glTF materials can select WebP images with `EXT_texture_webp`. The crate includes the codecs for slicing, projection and video generation. These two nodes need only the installed executor.
 
 ## Build from source
 

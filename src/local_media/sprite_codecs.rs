@@ -97,11 +97,11 @@ mod tests {
             let mut rgba = vec![0; 18 * 20 * 4];
             let offset = (i % 18 * 4) as usize;
             rgba[offset..offset + 4].copy_from_slice(&[255, 0, 0, 180]);
-            PngImage {
+            Ok(PngImage {
                 width: 18,
                 height: 20,
                 rgba,
-            }
+            })
         })
         .unwrap();
         let tracks = parse_mp4(&movie).unwrap();

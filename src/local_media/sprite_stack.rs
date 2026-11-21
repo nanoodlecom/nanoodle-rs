@@ -1,6 +1,7 @@
 //! Render horizontal stacks of square sprite tiles with an orthographic camera.
 use super::sprite_codecs::{decode_image, encode_turntable};
-use super::sprite_geometry::slice_model;
+use super::sprite_geometry::{slice_model, SliceSettings};
+use super::sprite_sequence::read_sequence;
 use super::{
     bytes_to_data_url, done, encode_png_rgba, err, input_text, js_number, url_bytes, PngImage,
 };
@@ -43,8 +44,8 @@ struct Layer {
     y: [f64; 2],
 }
 
-struct View<'a> {
-    sheet: &'a PngImage,
+struct View {
+    sheet: PngImage,
     layers: Vec<Layer>,
     layer_count: usize,
     tile: usize,
@@ -55,8 +56,8 @@ struct View<'a> {
     rise: f64,
 }
 
-impl<'a> View<'a> {
-    fn new(sheet: &'a PngImage, fields: &Map<String, Value>) -> Result<Self> {
+impl View {
+    fn new(sheet: PngImage, fields: &Map<String, Value>) -> Result<Self> {
         let tile = sheet.height as usize;
         if !(16..=128).contains(&tile)
             || sheet.width as usize % tile != 0
@@ -211,8 +212,8 @@ pub fn run_sprite(node: &Node, inputs: &HashMap<String, Value>) -> Result<NodeOu
     let fields = &node.fields;
     let mut ports = Map::new();
     if node.ty == "slice-3d" {
-        let palette_count = number(fields, "palette", 16., 0., 64., true)?;
-        let palette = if palette_count != 0. {
+        let settings = SliceSettings::new(fields)?;
+        let palette = if settings.colors != 0 {
             input_text(inputs, "paletteImage")
                 .filter(|url| !url.is_empty())
                 .map(|url| decode_image(&url_bytes(&url)?))
@@ -220,24 +221,61 @@ pub fn run_sprite(node: &Node, inputs: &HashMap<String, Value>) -> Result<NodeOu
         } else {
             None
         };
-        let (sheet, layout) = slice_model(&source, fields, palette.as_ref(), &decode_image)?;
-        let view = View::new(&sheet, &Map::new())?;
+        let sliced = slice_model(&source, fields, &settings, palette.as_ref(), &decode_image)?;
+        let bytes = sliced
+            .animation
+            .unwrap_or_else(|| encode_png_rgba(&sliced.first));
+        let view = View::new(sliced.first, &Map::new())?;
         ports.insert("image".into(), image_output(&view.frame(35.)));
-        ports.insert("layout".into(), Value::String(layout.to_string()));
-        ports.insert("sheet".into(), image_output(&sheet));
+        ports.insert("layout".into(), Value::String(sliced.layout.to_string()));
+        ports.insert(
+            "sheet".into(),
+            json!(bytes_to_data_url(&bytes, Some("image/png"))),
+        );
     } else {
-        let sheet = decode_image(&source)?;
+        let sequence = read_sequence(&source)?;
+        let sheet = match &sequence {
+            Some(sequence) => sequence.frame(0)?,
+            None => decode_image(&source)?,
+        };
         let yaw = number(fields, "yaw", 35., -3600., 3600., false)?;
-        let view = View::new(&sheet, fields)?;
+        let mut view = View::new(sheet, fields)?;
         ports.insert("image".into(), image_output(&view.frame(yaw)));
-        if flag(fields, "turntable", false) {
-            let fps = number(fields, "fps", 24., 1., 60., true)?;
-            let duration = number(fields, "duration", 3., 0.25, 30., false)?;
-            let start = number(fields, "yawStart", 0., -3600., 3600., false)?;
-            let end = number(fields, "yawEnd", 360., -3600., 3600., false)?;
-            let count = ((fps * duration).round() as u32).max(2);
+
+        let turntable = flag(fields, "turntable", false);
+        if turntable || sequence.is_some() {
+            let (count, duration, start, end) = if turntable {
+                let fps = number(fields, "fps", 24., 1., 60., true)?;
+                let duration = number(fields, "duration", 3., 0.25, 30., false)?;
+                let start = number(fields, "yawStart", 0., -3600., 3600., false)?;
+                let end = number(fields, "yawEnd", 360., -3600., 3600., false)?;
+                (
+                    ((fps * duration).round() as u32).max(2),
+                    duration,
+                    start,
+                    end,
+                )
+            } else {
+                let sequence = sequence.as_ref().unwrap();
+                (sequence.len() as u32, sequence.duration_seconds(), yaw, yaw)
+            };
+            let mut current = 0;
             let bytes = encode_turntable(view.width, view.height, count, duration, |i| {
-                view.frame(start + (end - start) * f64::from(i) / f64::from(count - 1))
+                if let Some(sequence) = &sequence {
+                    let target = if turntable {
+                        let elapsed = i as f64 * duration / count as f64;
+                        ((elapsed * sequence.len() as f64 / sequence.duration_seconds()).floor()
+                            as usize)
+                            % sequence.len()
+                    } else {
+                        i as usize
+                    };
+                    if target != current {
+                        view = View::new(sequence.frame(target)?, fields)?;
+                        current = target;
+                    }
+                }
+                Ok(view.frame(start + (end - start) * f64::from(i) / f64::from(count - 1)))
             })?;
             ports.insert(
                 "video".into(),
@@ -251,6 +289,73 @@ pub fn run_sprite(node: &Node, inputs: &HashMap<String, Value>) -> Result<NodeOu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn execute(ty: &str, fields: Value, port: &str, input: Value) -> Map<String, Value> {
+        let node = Node {
+            id: "n".into(),
+            ty: ty.into(),
+            name: None,
+            fields: fields.as_object().unwrap().clone(),
+            unknown: false,
+        };
+        match run_sprite(&node, &HashMap::from([(port.into(), input)])).unwrap() {
+            NodeOutcome::Done(ports, _) => ports,
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn rigged_walk_plays_each_sheet_pose_at_authored_timing() {
+        let model = bytes_to_data_url(
+            include_bytes!("../../tests/fixtures/sprite-knight.glb"),
+            Some("model/gltf-binary"),
+        );
+        let sliced = execute(
+            "slice-3d",
+            json!({"clip":"Walk","frames":4,"preset":"character","resolution":24,"slices":16}),
+            "model",
+            json!(model),
+        );
+        let layout: Value = serde_json::from_str(sliced["layout"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            layout["animation"],
+            json!({"clip":"Walk","frames":4,"duration":1.0,"times":[0.0,0.25,0.5,0.75]})
+        );
+        // The sword rises during Walk. The shared volume must fit its highest sampled tip.
+        assert!((layout["bounds"]["max"][1].as_f64().unwrap() - 3.56).abs() < 1e-5);
+        assert!(layout["bounds"]["min"][1].as_f64().unwrap().abs() < 1e-5);
+        let raw = url_bytes(sliced["sheet"].as_str().unwrap()).unwrap();
+        let sequence = read_sequence(&raw).unwrap().unwrap();
+        let poses: Vec<_> = (0..4)
+            .map(|i| View::new(sequence.frame(i).unwrap(), &Map::new()).unwrap())
+            .collect();
+        assert!(poses[0].sheet.rgba != poses[1].sheet.rgba);
+        for (fields, indices, yaws, duration) in [
+            (json!({"yaw":20}), vec![0, 1, 2, 3], vec![20.; 4], 1.),
+            (
+                json!({"turntable":true,"fps":4,"duration":1.5,"yawStart":0,"yawEnd":50}),
+                vec![0, 1, 2, 3, 0, 1],
+                vec![0., 10., 20., 30., 40., 50.],
+                1.5,
+            ),
+        ] {
+            let rendered = execute(
+                "sprite-stack-render",
+                fields,
+                "sheet",
+                sliced["sheet"].clone(),
+            );
+            let expected = encode_turntable(
+                poses[0].width,
+                poses[0].height,
+                indices.len() as u32,
+                duration,
+                |i| Ok(poses[indices[i as usize]].frame(yaws[i as usize])),
+            )
+            .unwrap();
+            assert!(url_bytes(rendered["video"].as_str().unwrap()).unwrap() == expected);
+        }
+    }
 
     #[test]
     fn rotated_translucent_layers_match_the_reference_pixels() {
@@ -284,7 +389,7 @@ mod tests {
             (-283., 42.75, 0.33, 2.5, (62, 50, 0x51a6de65)),
         ] {
             let fields = json!({"pitch":pitch,"spacing":spacing,"scale":scale});
-            let view = View::new(&sheet, fields.as_object().unwrap()).unwrap();
+            let view = View::new(sheet.clone(), fields.as_object().unwrap()).unwrap();
             let output = view.frame(yaw);
             let hash = output.rgba.iter().fold(2166136261u32, |h, &b| {
                 (h ^ u32::from(b)).wrapping_mul(16777619)
