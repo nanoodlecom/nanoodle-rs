@@ -1,9 +1,0 @@
-The VP8 and VP8L decoding, inverse transform, Huffman, filtering, prediction
-and YUV routines in this directory are adapted from image-rs/image-webp 0.2.4,
-commit 08b57d473c90148dd4b37a075df365afc3dfcc2b, under its MIT license.
-https://github.com/image-rs/image-webp/tree/08b57d473c90148dd4b37a075df365afc3dfcc2b
-The source distribution is also available from https://crates.io/crates/image-webp/0.2.4.
-
-This subset omits the encoder and the multi-frame and metadata APIs. It uses
-standard-library reads and native errors. Nanoodle validates RIFF chunk ranges
-and decoded dimensions before allocating picture buffers.
