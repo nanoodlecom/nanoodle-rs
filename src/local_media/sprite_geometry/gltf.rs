@@ -1,7 +1,12 @@
-//! Read the active, static triangle scene of a self-contained glTF 2 asset.
+//! Read and pose the active triangle scene of a self-contained glTF 2 asset.
+mod accessor;
+mod animation;
+mod scene;
+
 use super::{err, AlphaMode, Mesh, PngImage, Texture};
 use crate::local_media::{data_url_bytes, sniff_mime};
 use crate::Result;
+pub(super) use scene::Scene;
 use serde_json::Value;
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -206,79 +211,6 @@ impl<'a> Document<'a> {
         Ok((portion, view))
     }
 
-    // Decode directly into the final vector width. RGB attributes get an
-    // implicit alpha of one; the remaining supported shapes fill every slot.
-    fn accessor<const N: usize>(
-        &self,
-        id: &Value,
-        min_channels: usize,
-        count: Option<usize>,
-    ) -> Result<Vec<[f64; N]>> {
-        let a = get(&self.json["accessors"], id)?;
-        let n = match a["type"].as_str() {
-            Some("SCALAR") => 1,
-            Some("VEC2") => 2,
-            Some("VEC3") => 3,
-            Some("VEC4") => 4,
-            _ => 0,
-        };
-        let kind = index(&a["componentType"])?;
-        let (size, max) = match kind {
-            5120 => (1, 127.),
-            5121 => (1, 255.),
-            5122 => (2, 32767.),
-            5123 => (2, 65535.),
-            5125 => (4, 4294967295.),
-            5126 => (4, 1.),
-            _ => return Err(err("Unsupported glTF accessor component type.")),
-        };
-        if !(min_channels..=N).contains(&n) || !a["sparse"].is_null() || a["bufferView"].is_null() {
-            return Err(err("Unsupported glTF accessor type or sparse encoding."));
-        }
-        let (buf, view) = self.view(&a["bufferView"])?;
-        let width = n * size;
-        let stride = optional_index(&view["byteStride"], width)?;
-        let offset = optional_index(&a["byteOffset"], 0)?;
-        let rows = index(&a["count"])?;
-        let end = rows
-            .checked_sub(1)
-            .and_then(|n| n.checked_mul(stride))
-            .and_then(|n| n.checked_add(offset))
-            .and_then(|n| n.checked_add(width));
-        if stride < width || count.is_some_and(|c| rows != c) || end.is_none_or(|e| e > buf.len()) {
-            return Err(err("Invalid glTF accessor bounds or count."));
-        }
-        let normalized = a["normalized"].as_bool().unwrap_or(false);
-        let mut values = Vec::with_capacity(rows);
-        for row in 0..rows {
-            let start = offset + row * stride;
-            let mut values_row = [1.; N];
-            for (out, bytes) in values_row
-                .iter_mut()
-                .zip(buf[start..start + width].chunks_exact(size))
-            {
-                let value = match kind {
-                    5120 => (bytes[0] as i8) as f64,
-                    5121 => bytes[0] as f64,
-                    5122 => i16::from_le_bytes([bytes[0], bytes[1]]) as f64,
-                    5123 => u16::from_le_bytes([bytes[0], bytes[1]]) as f64,
-                    5125 => le32(bytes) as f64,
-                    _ => f32::from_bits(le32(bytes)) as f64,
-                };
-                if !value.is_finite() {
-                    return Err(err("Non-finite glTF attribute."));
-                }
-                *out = if normalized {
-                    (value / max).max(-1.)
-                } else {
-                    value
-                };
-            }
-            values.push(values_row);
-        }
-        Ok(values)
-    }
-
     fn texture(
         &self,
         info: &Value,
@@ -354,7 +286,6 @@ impl<'a> Document<'a> {
     fn primitive(
         &self,
         p: &Value,
-        world: &Matrix,
         cache: &mut HashMap<usize, DecodedImage>,
         decode: &dyn Fn(&[u8]) -> Result<PngImage>,
     ) -> Result<Mesh> {
@@ -362,24 +293,11 @@ impl<'a> Document<'a> {
         if !(4..=6).contains(&mode) {
             return Err(err("Slice 3D requires triangles. For a point-cloud preview, supply the original Gaussian PLY."));
         }
-        if !items(&p["targets"])?.is_empty()
-            || !p["extensions"]["KHR_draco_mesh_compression"].is_null()
-        {
-            return Err(err(
-                "Morph targets and Draco-compressed meshes are unsupported.",
-            ));
+        if !p["extensions"]["KHR_draco_mesh_compression"].is_null() {
+            return Err(err("Draco-compressed meshes are unsupported."));
         }
         let attrs = &p["attributes"];
-        let mut positions = self.accessor::<3>(&attrs["POSITION"], 3, None)?;
-        for point in &mut positions {
-            let [x, y, z] = *point;
-            *point = std::array::from_fn(|i| {
-                world[i] * x + world[i + 4] * y + world[i + 8] * z + world[i + 12]
-            });
-            if !point.iter().all(|v| v.is_finite()) {
-                return Err(err("Invalid glTF scene transform."));
-            }
-        }
+        let positions = self.accessor::<3>(&attrs["POSITION"], 3, None)?;
         let count = positions.len();
         let indices = if p["indices"].is_null() {
             None
@@ -456,96 +374,17 @@ impl<'a> Document<'a> {
         };
         Ok(Mesh {
             positions,
-            indices,
+            indices: indices.map(Rc::new),
             mode: mode as u32,
-            colors,
+            colors: colors.map(Rc::new),
             color_channels,
-            uvs,
+            uvs: uvs.map(Rc::new),
             texture,
             factor,
             alpha_mode,
             cutoff,
         })
     }
-}
-
-fn node_matrix(node: &Value) -> Result<Matrix> {
-    let msg = "Invalid glTF scene transform.";
-    if !node["matrix"].is_null() {
-        return numbers(&node["matrix"], IDENTITY, msg);
-    }
-    Ok(trs(
-        numbers(&node["translation"], [0.; 3], msg)?,
-        numbers(&node["rotation"], [0., 0., 0., 1.], msg)?,
-        numbers(&node["scale"], [1.; 3], msg)?,
-    ))
-}
-
-pub(super) fn parse(raw: &[u8], decode: &dyn Fn(&[u8]) -> Result<PngImage>) -> Result<Vec<Mesh>> {
-    let doc = Document::open(raw)?;
-    let mut meshes = Vec::new();
-    let mut textures = HashMap::new();
-    let mesh_defs = items(&doc.json["meshes"])?;
-    let mut emit = |i: usize, world: &Matrix| -> Result<()> {
-        let mesh = mesh_defs.get(i).ok_or_else(|| err("Missing glTF mesh."))?;
-        for p in items(&mesh["primitives"])? {
-            meshes.push(doc.primitive(p, world, &mut textures, decode)?);
-        }
-        Ok(())
-    };
-    let nodes = items(&doc.json["nodes"])?;
-    if nodes.is_empty() {
-        for i in 0..mesh_defs.len() {
-            emit(i, &IDENTITY)?;
-        }
-    } else {
-        let scene_id = optional_index(&doc.json["scene"], 0)?;
-        let roots = doc.json["scenes"]
-            .get(scene_id)
-            .and_then(|v| v.get("nodes"));
-        let roots = if let Some(roots) = roots {
-            items(roots)?
-                .iter()
-                .map(index)
-                .collect::<Result<Vec<_>>>()?
-        } else {
-            let mut child = vec![false; nodes.len()];
-            for node in nodes {
-                for v in items(&node["children"])? {
-                    *child
-                        .get_mut(index(v)?)
-                        .ok_or_else(|| err("Invalid glTF child node."))? = true;
-                }
-            }
-            (0..nodes.len()).filter(|&i| !child[i]).collect()
-        };
-        // glTF scene nodes form disjoint trees. An explicit stack also handles
-        // deeply nested scenes without growing the native call stack.
-        let mut seen = vec![false; nodes.len()];
-        let mut pending: Vec<_> = roots.into_iter().rev().map(|i| (i, IDENTITY)).collect();
-        while let Some((i, parent)) = pending.pop() {
-            let node = nodes
-                .get(i)
-                .ok_or_else(|| err("Invalid or cyclic glTF node tree."))?;
-            if std::mem::replace(&mut seen[i], true) {
-                return Err(err("Invalid or cyclic glTF node tree."));
-            }
-            if !node["skin"].is_null() {
-                return Err(err("Skinned meshes require a static mesh export."));
-            }
-            let world = multiply(&parent, &node_matrix(node)?);
-            if !node["mesh"].is_null() {
-                emit(index(&node["mesh"])?, &world)?;
-            }
-            for child in items(&node["children"])?.iter().rev() {
-                pending.push((index(child)?, world));
-            }
-        }
-    }
-    if meshes.is_empty() {
-        return Err(err("No triangles in the selected glTF scene."));
-    }
-    Ok(meshes)
 }
 
 #[cfg(test)]
@@ -677,3 +516,6 @@ mod webp_tests {
             .contains("must contain a WebP"));
     }
 }
+
+#[cfg(test)]
+mod pose_tests;
