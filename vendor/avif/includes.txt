@@ -1,0 +1,6 @@
+.
+dav1d
+dav1d/include
+dav1d/include/dav1d
+libavif/include
+libavif/third_party/libyuv/include

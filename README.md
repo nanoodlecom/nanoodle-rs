@@ -57,7 +57,7 @@ supply a local model catalog.
 
 ## Sprite stacking
 
-Wire `mupload.model` to `slice-3d.model`, then `slice-3d.sheet` to `sprite-stack-render.sheet`. A static triangle GLB, self-contained glTF or uncompressed Gaussian PLY produces a transparent PNG strip, JSON layout text and a preview. The renderer takes the strip alone. It emits a PNG and an optional MP4 turntable. The Rust executor reads PNG, JPEG, GIF, WebP, BMP and ICO textures and palettes. Model parsing, slicing, projection, image decoding and turntable encoding run in native Rust. These two nodes need only the installed executor.
+Wire `mupload.model` to `slice-3d.model`, then `slice-3d.sheet` to `sprite-stack-render.sheet`. A static triangle GLB, self-contained glTF or uncompressed Gaussian PLY produces a transparent PNG strip, JSON layout text and a preview. The renderer takes the strip alone. It emits a PNG and an optional MP4 turntable. The Rust executor reads PNG, JPEG, GIF, WebP, BMP, ICO, CUR and AVIF textures and palettes. glTF materials can select WebP images with `EXT_texture_webp`. Rust handles slicing, projection and H.264 turntable encoding. The crate compiles its AVIF decoder into the executor. These two nodes need only the installed executor.
 
 ## Build from source
 
@@ -104,3 +104,5 @@ joins receive active inputs, and an invalid decision opens neither route. Existi
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+The packaged AVIF decoder includes libavif, dav1d and libyuv source with their upstream licenses. See [codec notices and revisions](vendor/avif/README.md).

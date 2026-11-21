@@ -13,6 +13,23 @@ env:
   RUST_TOOLCHAIN: '1.95.0'
 
 jobs:
+  native-codecs:
+    name: Sprite codecs (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the Rust toolchain
+        run: rustup toolchain install ${{ env.RUST_TOOLCHAIN }} --profile minimal
+      - name: Exercise compiled image and video codecs
+        run: cargo +${{ env.RUST_TOOLCHAIN }} test --locked --lib local_media::sprite_
+
   check:
     name: Test and package
     runs-on: ubuntu-latest
@@ -58,7 +75,7 @@ jobs:
 
   publish:
     name: Publish to crates.io
-    needs: check
+    needs: [check, native-codecs]
     if: >-
       github.repository == 'nanoodlecom/nanoodle-rs' &&
       github.event_name == 'push' && github.ref == 'refs/heads/main' &&

@@ -282,9 +282,11 @@ fn is_missing_ffmpeg(e: &NanoodleError) -> bool {
     e.0.contains("need ffmpeg on PATH")
 }
 
+mod sprite_avif;
 mod sprite_codecs;
 mod sprite_geometry;
 mod sprite_jpeg;
+mod sprite_orientation;
 mod sprite_stack;
 mod sprite_webp;
 pub use sprite_stack::run_sprite;

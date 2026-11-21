@@ -13,6 +13,8 @@ pub(super) use video::encode_turntable;
 pub(super) fn decode_image(raw: &[u8]) -> Result<PngImage> {
     let image = if raw.starts_with(b"\x89PNG\r\n\x1a\n") {
         read_png(raw, true)
+    } else if super::sprite_avif::is_avif(raw) {
+        super::sprite_avif::decode(raw)
     } else if raw.starts_with(&[0xff, 0xd8]) {
         super::sprite_jpeg::decode_jpeg(raw)
     } else if raw.starts_with(b"RIFF") && raw.get(8..12) == Some(b"WEBP") {
@@ -25,13 +27,13 @@ pub(super) fn decode_image(raw: &[u8]) -> Result<PngImage> {
         bmp::decode_icon(raw)
     } else {
         Err(err(
-            "Unsupported sprite image format; use PNG, JPEG, GIF, WebP, BMP or ICO.",
+            "Unsupported sprite image format; use PNG, JPEG, GIF, WebP, BMP, ICO, CUR or AVIF.",
         ))
     }?;
     Ok(super::sprite_orientation::apply(raw, image))
 }
 
-fn dimensions(width: usize, height: usize, allow_strip: bool) -> Result<()> {
+pub(super) fn dimensions(width: usize, height: usize, allow_strip: bool) -> Result<()> {
     let max_width = if allow_strip && height <= 128 {
         128 * 128
     } else {
