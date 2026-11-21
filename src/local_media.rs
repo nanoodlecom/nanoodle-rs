@@ -542,45 +542,47 @@ impl<'a> BitReader<'a> {
 
 /// Canonical Huffman decoder built from code lengths.
 struct Huffman {
-    /// (code, len, symbol) sorted for linear scan — streams here are small.
-    entries: Vec<(u32, u8, u16)>,
-    max_len: u8,
+    first_code: [u32; 16],
+    first_symbol: [usize; 16],
+    counts: [usize; 16],
+    symbols: Vec<u16>,
+    max_len: usize,
 }
 
 impl Huffman {
     fn new(lengths: &[u8]) -> Huffman {
-        let mut bl_count = [0u32; 16];
-        for &l in lengths {
-            if l > 0 {
-                bl_count[l as usize] += 1;
+        let mut tree = Huffman {
+            first_code: [0; 16],
+            first_symbol: [0; 16],
+            counts: [0; 16],
+            symbols: Vec::with_capacity(lengths.len()),
+            max_len: 0,
+        };
+        for &len in lengths {
+            if len > 0 {
+                tree.counts[len as usize] += 1;
+                tree.max_len = tree.max_len.max(len as usize);
             }
         }
-        let mut next_code = [0u32; 16];
-        let mut code: u32 = 0;
-        for bits in 1..16 {
-            code = (code + bl_count[bits - 1]) << 1;
-            next_code[bits] = code;
-        }
-        let mut entries = Vec::new();
-        let mut max_len = 0u8;
-        for (sym, &l) in lengths.iter().enumerate() {
-            if l > 0 {
-                let c = next_code[l as usize];
-                next_code[l as usize] += 1;
-                entries.push((c, l, sym as u16));
-                max_len = max_len.max(l);
+        for len in 1..=tree.max_len {
+            tree.first_code[len] = (tree.first_code[len - 1] + tree.counts[len - 1] as u32) << 1;
+            tree.first_symbol[len] = tree.symbols.len();
+            for (symbol, &n) in lengths.iter().enumerate() {
+                if n as usize == len {
+                    tree.symbols.push(symbol as u16);
+                }
             }
         }
-        Huffman { entries, max_len }
+        tree
     }
+
     fn decode(&self, br: &mut BitReader) -> Result<u16> {
         let mut code: u32 = 0;
         for len in 1..=self.max_len {
             code = (code << 1) | br.bits(1)?;
-            for &(c, l, sym) in &self.entries {
-                if l == len && c == code {
-                    return Ok(sym);
-                }
+            let offset = code.wrapping_sub(self.first_code[len]) as usize;
+            if offset < self.counts[len] {
+                return Ok(self.symbols[self.first_symbol[len] + offset]);
             }
         }
         Err(err("bad huffman code in deflate stream"))
@@ -608,11 +610,17 @@ fn inflate_block(
     out: &mut Vec<u8>,
     lit: &Huffman,
     dist: &Huffman,
+    limit: usize,
 ) -> Result<bool> {
     loop {
         let sym = lit.decode(br)?;
         match sym {
-            0..=255 => out.push(sym as u8),
+            0..=255 => {
+                if out.len() == limit {
+                    return Err(err("deflate output exceeds image dimensions"));
+                }
+                out.push(sym as u8);
+            }
             256 => return Ok(true),
             257..=285 => {
                 let idx = (sym - 257) as usize;
@@ -629,6 +637,9 @@ fn inflate_block(
                 if d > out.len() {
                     return Err(err("deflate distance too far back"));
                 }
+                if len as usize > limit - out.len() {
+                    return Err(err("deflate output exceeds image dimensions"));
+                }
                 let start = out.len() - d;
                 for i in 0..len as usize {
                     let v = out[start + i];
@@ -640,7 +651,7 @@ fn inflate_block(
     }
 }
 
-fn inflate(data: &[u8]) -> Result<Vec<u8>> {
+fn inflate(data: &[u8], limit: usize) -> Result<Vec<u8>> {
     let mut br = BitReader::new(data);
     let mut out: Vec<u8> = Vec::new();
     loop {
@@ -662,6 +673,9 @@ fn inflate(data: &[u8]) -> Result<Vec<u8>> {
                 if from + len > data.len() {
                     return Err(err("truncated stored deflate block"));
                 }
+                if len > limit - out.len() {
+                    return Err(err("deflate output exceeds image dimensions"));
+                }
                 out.extend_from_slice(&data[from..from + len]);
                 br.pos = (from + len) * 8;
             }
@@ -671,7 +685,7 @@ fn inflate(data: &[u8]) -> Result<Vec<u8>> {
                 lit_lengths[256..280].fill(7);
                 let lit = Huffman::new(&lit_lengths);
                 let dist = Huffman::new(&[5u8; 30]);
-                inflate_block(&mut br, &mut out, &lit, &dist)?;
+                inflate_block(&mut br, &mut out, &lit, &dist, limit)?;
             }
             2 => {
                 let hlit = br.bits(5)? as usize + 257;
@@ -733,7 +747,7 @@ fn inflate(data: &[u8]) -> Result<Vec<u8>> {
                 dist_l[..hdist].copy_from_slice(&lengths[hlit..]);
                 let lit = Huffman::new(&lit_l);
                 let dist = Huffman::new(&dist_l);
-                inflate_block(&mut br, &mut out, &lit, &dist)?;
+                inflate_block(&mut br, &mut out, &lit, &dist, limit)?;
             }
             _ => return Err(err("bad deflate block type")),
         }
@@ -744,12 +758,12 @@ fn inflate(data: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// zlib stream: 0x78 0xDA + deflate payload + adler32.
-fn zlib_inflate(data: &[u8]) -> Result<Vec<u8>> {
+/// Inflate at most the number of bytes declared by the image header.
+fn zlib_inflate(data: &[u8], limit: usize) -> Result<Vec<u8>> {
     if data.len() < 2 {
         return Err(err("bad zlib stream"));
     }
-    let out = inflate(&data[2..])?;
+    let out = inflate(&data[2..], limit)?;
     if data.len() >= 6 {
         let stored = u32::from_be_bytes([
             data[data.len() - 4],
@@ -929,7 +943,7 @@ fn deflate_match_outside_32k_window_reencodes_as_literals() {
     let mut pixels = marker.to_vec();
     pixels.resize(65_536, 0);
     pixels.extend_from_slice(marker);
-    assert_eq!(zlib_inflate(&zlib_deflate(&pixels)).unwrap(), pixels);
+    assert_eq!(zlib_inflate(&zlib_deflate(&pixels), pixels.len()).unwrap(), pixels);
 }
 
 fn crc32(data: &[u8]) -> u32 {
@@ -956,151 +970,9 @@ struct PngImage {
     rgba: Vec<u8>, // RGBA, width*height*4
 }
 
-/// decodePng mirror: 8-bit, color types 0/2/4/6, no interlace, ≤8192 dims.
+/// Local media operations retain their existing per-side image limit.
 fn decode_png(bytes: &[u8]) -> Result<PngImage> {
-    if bytes.len() < 8 || bytes[0] != 0x89 || &bytes[1..4] != b"PNG" {
-        return Err(err("couldn't read that image to resize"));
-    }
-    let mut pos = 8usize;
-    let (mut w, mut h, mut bit_depth, mut color_type, mut interlace) = (0u32, 0u32, 0u8, 0u8, 0u8);
-    let mut idat: Vec<u8> = Vec::new();
-    let mut palette: Vec<u8> = Vec::new();
-    let mut trns: Vec<u8> = Vec::new();
-    while pos + 8 <= bytes.len() {
-        let len = u32::from_be_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]]) as usize;
-        let ty = &bytes[pos + 4..pos + 8];
-        let data_start = pos + 8;
-        if data_start + len > bytes.len() {
-            break;
-        }
-        let data = &bytes[data_start..data_start + len];
-        match ty {
-            b"IHDR" if len >= 13 => {
-                w = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
-                h = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
-                bit_depth = data[8];
-                color_type = data[9];
-                interlace = data[12];
-            }
-            b"PLTE" => palette = data.to_vec(),
-            b"tRNS" => trns = data.to_vec(),
-            b"IDAT" => idat.extend_from_slice(data),
-            b"IEND" => break,
-            _ => {}
-        }
-        pos = data_start + len + 4;
-    }
-    if w == 0 || h == 0 {
-        return Err(err("couldn't read that image to resize"));
-    }
-    if w > MAX_IMAGE_DIM || h > MAX_IMAGE_DIM {
-        return Err(err(format!(
-            "image is too large to resize in-process ({}×{}; max {}px per side)",
-            w, h, MAX_IMAGE_DIM
-        )));
-    }
-    if bit_depth != 8 || interlace != 0 || !matches!(color_type, 0 | 2 | 3 | 4 | 6) {
-        return Err(err("couldn't read that image to resize"));
-    }
-    let bpp: usize = match color_type {
-        6 => 4,
-        2 => 3,
-        4 => 2,
-        _ => 1,
-    };
-    let raw = zlib_inflate(&idat).map_err(|_| err("couldn't read that image to resize"))?;
-    let stride = w as usize * bpp;
-    let expected = (stride + 1) * h as usize;
-    if raw.len() < expected {
-        return Err(err("couldn't read that image to resize"));
-    }
-    // unfilter (index-based: the current row's left neighbors are read from
-    // the same buffer being written, exactly like the JS typed-array code)
-    let mut px = vec![0u8; stride * h as usize];
-    for y in 0..h as usize {
-        let f = raw[y * (stride + 1)];
-        let row_off = y * (stride + 1) + 1;
-        let out_off = y * stride;
-        match f {
-            0 => px[out_off..out_off + stride].copy_from_slice(&raw[row_off..row_off + stride]),
-            1 => {
-                for x in 0..stride {
-                    let a = if x >= bpp { px[out_off + x - bpp] } else { 0 };
-                    px[out_off + x] = raw[row_off + x].wrapping_add(a);
-                }
-            }
-            2 => {
-                for x in 0..stride {
-                    let b = if y > 0 { px[out_off - stride + x] } else { 0 };
-                    px[out_off + x] = raw[row_off + x].wrapping_add(b);
-                }
-            }
-            3 => {
-                for x in 0..stride {
-                    let a = if x >= bpp { px[out_off + x - bpp] as u16 } else { 0 };
-                    let b = if y > 0 { px[out_off - stride + x] as u16 } else { 0 };
-                    px[out_off + x] = raw[row_off + x].wrapping_add(((a + b) / 2) as u8);
-                }
-            }
-            4 => {
-                for x in 0..stride {
-                    let a = if x >= bpp { px[out_off + x - bpp] as i32 } else { 0 };
-                    let b = if y > 0 { px[out_off - stride + x] as i32 } else { 0 };
-                    let c = if x >= bpp && y > 0 { px[out_off - stride + x - bpp] as i32 } else { 0 };
-                    let p = a + b - c;
-                    let (pa, pb, pc) = ((p - a).abs(), (p - b).abs(), (p - c).abs());
-                    let pr = if pa <= pb && pa <= pc { a } else if pb <= pc { b } else { c };
-                    px[out_off + x] = raw[row_off + x].wrapping_add(pr as u8);
-                }
-            }
-            _ => return Err(err("couldn't read that image to resize")),
-        }
-    }
-    // expand to RGBA
-    let mut rgba = vec![0u8; w as usize * h as usize * 4];
-    let npix = w as usize * h as usize;
-    match color_type {
-        6 => rgba.copy_from_slice(&px[..npix * 4]),
-        2 => {
-            for i in 0..npix {
-                rgba[i * 4] = px[i * 3];
-                rgba[i * 4 + 1] = px[i * 3 + 1];
-                rgba[i * 4 + 2] = px[i * 3 + 2];
-                rgba[i * 4 + 3] = 255;
-            }
-        }
-        0 => {
-            for i in 0..npix {
-                let g = px[i];
-                rgba[i * 4] = g;
-                rgba[i * 4 + 1] = g;
-                rgba[i * 4 + 2] = g;
-                rgba[i * 4 + 3] = 255;
-            }
-        }
-        4 => {
-            for i in 0..npix {
-                let g = px[i * 2];
-                rgba[i * 4] = g;
-                rgba[i * 4 + 1] = g;
-                rgba[i * 4 + 2] = g;
-                rgba[i * 4 + 3] = px[i * 2 + 1];
-            }
-        }
-        3 => {
-            for i in 0..npix {
-                let idx = px[i] as usize;
-                if idx * 3 + 2 < palette.len() {
-                    rgba[i * 4] = palette[idx * 3];
-                    rgba[i * 4 + 1] = palette[idx * 3 + 1];
-                    rgba[i * 4 + 2] = palette[idx * 3 + 2];
-                }
-                rgba[i * 4 + 3] = if idx < trns.len() { trns[idx] } else { 255 };
-            }
-        }
-        _ => unreachable!(),
-    }
-    Ok(PngImage { width: w, height: h, rgba })
+    sprite_codecs::read_png(bytes, false)
 }
 
 fn png_chunk(out: &mut Vec<u8>, ty: &[u8; 4], data: &[u8]) {
@@ -2427,11 +2299,21 @@ fn concat_mp4(buffers: &[Vec<u8>]) -> std::result::Result<Vec<u8>, String> {
     }
     let mdat = bx_box("mdat", &[&mdat_data]);
 
+    let moov = movie_box(&out_tracks);
+    let mut out = Vec::with_capacity(ftyp.len() + mdat.len() + moov.len());
+    out.extend_from_slice(&ftyp);
+    out.extend_from_slice(&mdat);
+    out.extend_from_slice(&moov);
+    Ok(out)
+}
+
+/// Build the sample tables and headers for both stream-copy and freshly encoded movies.
+fn movie_box(out_tracks: &[MergedTrack]) -> Vec<u8> {
     let mv_timescale: i64 = 1000;
     let mut max_dur_ms: i64 = 0;
     let mut trak_boxes: Vec<Vec<u8>> = Vec::new();
     let mut track_id: u32 = 1;
-    for t in &out_tracks {
+    for t in out_tracks {
         let total_ticks: i64 = t.samples.iter().map(|s| s.dur).sum();
         let dur_ms = js_round(total_ticks as f64 / t.timescale as f64 * mv_timescale as f64) as i64;
         if dur_ms > max_dur_ms {
@@ -2590,12 +2472,7 @@ fn concat_mp4(buffers: &[Vec<u8>]) -> std::result::Result<Vec<u8>, String> {
     for tb in &trak_boxes {
         moov_parts.push(tb);
     }
-    let moov = bx_box("moov", &moov_parts);
-    let mut out = Vec::with_capacity(ftyp.len() + mdat.len() + moov.len());
-    out.extend_from_slice(&ftyp);
-    out.extend_from_slice(&mdat);
-    out.extend_from_slice(&moov);
-    Ok(out)
+    bx_box("moov", &moov_parts)
 }
 
 // ---------------------------------------------------------------- API legs (inpaint / lipsync)
