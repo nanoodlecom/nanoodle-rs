@@ -214,6 +214,14 @@ fn scrub_media_placeholders(n: &mut Node, warnings: &mut Vec<String>) {
         let v = match n.fields.get(k) {
             None | Some(Value::Null) => continue,
             Some(Value::String(s)) if s.is_empty() || is_media_url(s) => continue,
+            Some(Value::String(s)) if s.strip_prefix("examples/").is_some_and(|path| {
+                !path.is_empty() && !path.contains("..") &&
+                    path.bytes().all(|b| b.is_ascii_alphanumeric() || b"_./-".contains(&b))
+            }) => {
+                let url = format!("https://nanoodle.com/{s}");
+                n.fields.insert(k.to_owned(), Value::String(url));
+                continue;
+            }
             Some(v) => v.clone(),
         };
         let shown = match &v {
