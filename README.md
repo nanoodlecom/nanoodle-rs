@@ -2,16 +2,13 @@
 
 A Rust executor for [nanoodle](https://nanoodle.com) workflow graphs — the
 third implementation of the same frozen graph format, alongside the
-JavaScript (`nanoodle`) and Python (`nanoodle`) SDKs. It loads and runs the
-exact graphs the editor and the other executors run: all 31 node types,
-including chat, image, video, audio, 3D (generation and mesh processing such
+JavaScript (`nanoodle`) and Python (`nanoodle`) SDKs. It runs saved editor graphs for
+chat, image, video, audio, 3D (generation and mesh processing such
 as Hyper3D Rigging), Decide gates, custom endpoints, and the local media
 nodes (resize, trim, frame extraction, combine, soundtrack, lipsync,
-inpaint).
+inpaint, Slice 3D and Sprite stack render).
 
-Built to be a core you can put anywhere: one static binary, ~3 MB, cold
-process + graph load in ~2 ms, and a persistent worker-pool scheduler that
-runs independent nodes concurrently.
+The compiled CLI embeds the sprite renderer and runs independent nodes concurrently.
 
 ## Install
 
@@ -57,6 +54,10 @@ The run report includes the outputs, node statuses, cost, and errors.
 If the run fails, it includes the error and any results produced so far.
 Use `--base-url` for a compatible provider or `--catalog catalog.json` to
 supply a local model catalog.
+
+## Sprite stacking
+
+Wire `mupload.model` to `slice-3d.model`, then `slice-3d.sheet` to `sprite-stack-render.sheet`. A static triangle GLB, self-contained glTF or uncompressed Gaussian PLY produces a transparent PNG strip, JSON layout text and a preview. The renderer takes the strip alone. It emits a PNG and an optional MP4 turntable. The crate embeds QuickJS and the shared sprite renderer. Install FFmpeg on PATH for additional image codecs and video encoding.
 
 ## Build from source
 

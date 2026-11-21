@@ -1,6 +1,6 @@
 [package]
 name = "nanoodle"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 description = "Rust executor for nanoodle graphs — same frozen format, conformance-suite proven"
 license = "MIT"
@@ -12,6 +12,7 @@ name = "nanoodle-rs"
 path = "src/main.rs"
 
 [dependencies]
+rquickjs = { version = "0.14", default-features = false, features = ["std"] }
 serde_json = "1"
 ureq = { version = "3", features = ["rustls", "json"] }
 

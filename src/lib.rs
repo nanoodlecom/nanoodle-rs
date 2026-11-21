@@ -74,6 +74,8 @@ fn node_type(ty: &str) -> Option<(&'static str, &'static [&'static str], &'stati
         "image" => ("Image", &[][..], &["image"][..]),
         "edit" => ("Edit", &[][..], &["image"][..]),
         "inpaint" => ("Inpaint", &["image", "mask"][..], &["image"][..]),
+        "slice-3d" => ("Slice 3D", &["model", "paletteImage"][..], &["sheet", "layout", "image"][..]),
+        "sprite-stack-render" => ("Sprite stack render", &["sheet"][..], &["image", "video"][..]),
         "resize" => ("Resize / crop", &["image"][..], &["image"][..]),
         "vision" => ("Vision", &["image"][..], &["text"][..]),
         "decide" => ("Decide", &["text"][..], &["text", "image"][..]),
@@ -100,7 +102,7 @@ fn node_type(ty: &str) -> Option<(&'static str, &'static [&'static str], &'stati
 
 pub const NODE_TYPE_NAMES: &[&str] = &[
     "text", "upload", "aupload", "vupload", "mupload", "choice", "join", "llm",
-    "image", "edit", "inpaint", "resize", "vision", "decide", "tvideo", "ivideo",
+    "image", "edit", "inpaint", "resize", "slice-3d", "sprite-stack-render", "vision", "decide", "tvideo", "ivideo",
     "model3d", "vedit", "vframes", "combine", "soundtrack", "lipsync", "music",
     "remix", "tts", "trim", "extractaudio", "transcribe", "cleanvoice",
     "endpoint", "comment",
@@ -661,6 +663,7 @@ fn run_node(
         "transcribe" => audio::run_transcribe(node, inputs, ctx).map_err(Into::into),
         "cleanvoice" => audio::run_cleanvoice(node, inputs, ctx),
         "endpoint" => endpoint::run_endpoint(node, inputs, ctx).map_err(Into::into),
+        "slice-3d" | "sprite-stack-render" => local_media::run_sprite(node, inputs).map_err(Into::into),
         "resize" => local_media::run_resize(node, inputs, ctx).map_err(Into::into),
         "vframes" => local_media::run_vframes(node, inputs, ctx).map_err(Into::into),
         "combine" => local_media::run_combine(node, inputs, ctx).map_err(Into::into),

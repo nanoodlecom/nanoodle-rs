@@ -282,6 +282,9 @@ fn is_missing_ffmpeg(e: &NanoodleError) -> bool {
     e.0.contains("need ffmpeg on PATH")
 }
 
+mod sprite_stack;
+pub use sprite_stack::run_sprite;
+
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 struct TempDir(PathBuf);
