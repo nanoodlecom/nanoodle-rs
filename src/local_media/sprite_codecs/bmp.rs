@@ -230,9 +230,10 @@ impl<'a> Dib<'a> {
 /// and word-aligned literal runs. Return the byte after the end marker.
 fn rle(info: &Dib, data: &[u8], rgba: &mut [u8]) -> Result<usize> {
     let (mut x, mut y, mut pos) = (0usize, 0usize, 0usize);
-    let background = info.color(0)?;
+    // The bitmap backing store is cleared to black. RLE deltas and short
+    // rows leave those pixels untouched, even when palette entry zero is colored.
     for pixel in rgba.chunks_exact_mut(4) {
-        pixel.copy_from_slice(&background);
+        pixel[3] = 255;
     }
     loop {
         let pair = bytes(data, pos, 2)?;

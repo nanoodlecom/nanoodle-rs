@@ -80,6 +80,13 @@ pub(in crate::local_media) fn read_png(raw: &[u8], allow_strip: bool) -> Result<
     if raw[26] != 0 || raw[27] != 0 || interlace > 1 {
         return Err(err("Unsupported PNG coding method"));
     }
+    let (canvas_width, canvas_height) = (width, height);
+    let (mut width, mut height) = (width, height);
+    let (mut left, mut top) = (0usize, 0usize);
+    let mut animated = false;
+    let mut got_frame = false;
+    let mut separate_poster = false;
+    let mut blend_over = false;
     let mut idat = Vec::new();
     let mut palette = &[][..];
     let mut alpha = &[][..];
@@ -93,7 +100,44 @@ pub(in crate::local_media) fn read_png(raw: &[u8], allow_strip: bool) -> Result<
             .ok_or_else(|| err("Truncated PNG chunk"))?;
         let body = &raw[pos + 8..end - 4];
         match &header[4..8] {
-            b"IDAT" => idat.extend_from_slice(body),
+            b"acTL" if allow_strip && body.len() == 8 && idat.is_empty() => {
+                animated = u32::from_be_bytes(body[..4].try_into().unwrap()) != 0;
+            }
+            b"fcTL" if animated => {
+                if got_frame {
+                    break;
+                }
+                if body.len() != 26 || body[25] > 1 {
+                    return Err(err("Invalid APNG frame control"));
+                }
+                let word =
+                    |i: usize| u32::from_be_bytes(body[i..i + 4].try_into().unwrap()) as usize;
+                (width, height, left, top) = (word(4), word(8), word(12), word(16));
+                if width == 0
+                    || height == 0
+                    || width > canvas_width
+                    || height > canvas_height
+                    || left > canvas_width - width
+                    || top > canvas_height - height
+                {
+                    return Err(err("APNG frame lies outside the canvas"));
+                }
+                // An fcTL after IDAT starts the first animation frame. Those earlier IDAT
+                // pixels are a standalone poster and do not participate in composition.
+                separate_poster = !idat.is_empty();
+                if separate_poster {
+                    idat.clear();
+                }
+                blend_over = body[25] == 1;
+                got_frame = true;
+            }
+            b"fdAT" if got_frame && separate_poster => {
+                idat.extend_from_slice(
+                    body.get(4..)
+                        .ok_or_else(|| err("Truncated APNG frame data"))?,
+                );
+            }
+            b"IDAT" if !separate_poster => idat.extend_from_slice(body),
             b"PLTE" => palette = body,
             b"tRNS" => alpha = body,
             b"IEND" => break,
@@ -126,7 +170,7 @@ pub(in crate::local_media) fn read_png(raw: &[u8], allow_strip: bool) -> Result<
         .chunks_exact(2)
         .map(|b| u16::from_be_bytes([b[0], b[1]]))
         .collect();
-    let mut rgba = vec![0u8; width * height * 4];
+    let mut rgba = vec![0u8; canvas_width * canvas_height * 4];
     let mut lines = scan.as_mut_slice();
     for &(x, y, dx, dy) in passes {
         let columns = extents(x, width, dx);
@@ -142,7 +186,7 @@ pub(in crate::local_media) fn read_png(raw: &[u8], allow_strip: bool) -> Result<
             unfilter(row, &prev, bits_per_pixel.div_ceil(8), filter[0])?;
             prev.copy_from_slice(row);
             if color == 6 && depth == 8 && dx == 1 {
-                let out = 4 * (row_y * width + x);
+                let out = 4 * ((top + row_y) * canvas_width + left + x);
                 rgba[out..out + stride].copy_from_slice(row);
                 continue;
             }
@@ -183,14 +227,54 @@ pub(in crate::local_media) fn read_png(raw: &[u8], allow_strip: bool) -> Result<
                     4 => [scale(first), scale(first), scale(first), scale(get(1))],
                     _ => [scale(first), scale(get(1)), scale(get(2)), scale(get(3))],
                 };
-                let out = 4 * (row_y * width + x + lane * dx);
+                let out = 4 * ((top + row_y) * canvas_width + left + x + lane * dx);
                 rgba[out..out + 4].copy_from_slice(&pixel);
             }
         }
     }
+    // SOURCE and OVER both draw the first frame onto transparent black. Only
+    // hidden RGB from completely transparent OVER pixels must be discarded.
+    if blend_over {
+        for pixel in rgba.chunks_exact_mut(4) {
+            if pixel[3] == 0 {
+                pixel.fill(0);
+            }
+        }
+    }
     Ok(PngImage {
-        width: width as u32,
-        height: height as u32,
+        width: canvas_width as u32,
+        height: canvas_height as u32,
         rgba,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::local_media::{png_chunk, zlib_deflate};
+
+    #[test]
+    fn first_animation_frame_uses_its_subrectangle_and_excludes_the_poster() {
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        png_chunk(&mut png, b"IHDR", &[0, 0, 0, 3, 0, 0, 0, 1, 8, 6, 0, 0, 0]);
+        png_chunk(&mut png, b"acTL", &[0, 0, 0, 1, 0, 0, 0, 0]);
+        png_chunk(
+            &mut png,
+            b"IDAT",
+            &zlib_deflate(&[0, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255]),
+        );
+        let mut control = Vec::new();
+        for v in [0u32, 2, 1, 1, 0] {
+            control.extend_from_slice(&v.to_be_bytes());
+        }
+        control.extend_from_slice(&[0, 1, 0, 1, 0, 1]); // duration 1s; source over
+        png_chunk(&mut png, b"fcTL", &control);
+        let mut frame = 1u32.to_be_bytes().to_vec();
+        frame.extend_from_slice(&zlib_deflate(&[0, 0, 255, 0, 128, 255, 0, 0, 0]));
+        png_chunk(&mut png, b"fdAT", &frame);
+        png_chunk(&mut png, b"IEND", &[]);
+        let image = read_png(&png, true).unwrap();
+        assert_eq!((image.width, image.height), (3, 1));
+        assert_eq!(image.rgba, [0, 0, 0, 0, 0, 255, 0, 128, 0, 0, 0, 0]);
+    }
 }
