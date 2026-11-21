@@ -35,9 +35,13 @@ optimization, and NDEBUG. Use the platform C math and threading libraries
 _GNU_SOURCE. On MSVC prepend `dav1d/include/compat/msvc` to the include
 directories, pass /std:c11, and include the Windows thread unit already in the
 manifest. Upstream dav1d provides both the SRWLOCK-based Win32 adapter and
-the MSVC atomics shim. Only native Linux x86_64 compilation and execution have
-been verified with this pack.
+the MSVC atomics shim. All decoder C units also compiled and linked for x86_64 Windows GNU,
+AArch64 macOS and AArch64 Linux musl with Zig/Clang. The decoder suite ran
+on native x86_64 Linux.
 
-The library decodes the first primary picture/animation frame. The return buffer
-contains raw picture samples. Presentation cropping, rotation and mirroring
-metadata are available in libavif should a caller require those transforms.
+The library decodes the first primary picture or animation frame. It applies
+valid top-left clean apertures (clap), counter-clockwise rotation (irot) and
+mirroring (imir) in display order. Invalid apertures and apertures with an
+offset display the full frame, following Chromium. The output is tightly
+packed, straight-alpha RGBA. The Rust tests include encoded samples for all
+three transformations.

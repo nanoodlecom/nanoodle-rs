@@ -102,6 +102,52 @@ mod tests {
     }
 
     #[test]
+    fn presents_rotated_images() {
+        let image = decode(include_bytes!(
+            "../../tests/fixtures/sprite-palette-rotated.avif"
+        ))
+        .unwrap();
+        assert_eq!((image.width, image.height), (11, 16));
+        assert_eq!(image.rgba[3], 255);
+        assert_eq!(image.rgba[11 * 15 * 4 + 3], 0);
+    }
+
+    #[test]
+    fn displays_only_top_left_apertures_before_orientation() {
+        let base = decode(ALPHA).unwrap();
+        for (file, width, height) in [
+            (
+                include_bytes!("../../tests/fixtures/sprite-palette-cropped.avif").as_slice(),
+                16,
+                16,
+            ),
+            (
+                include_bytes!("../../tests/fixtures/sprite-palette-top-left.avif").as_slice(),
+                6,
+                10,
+            ),
+        ] {
+            let display = decode(file).unwrap();
+            assert_eq!(
+                (display.width, display.height),
+                (width as u32, height as u32)
+            );
+            for y in 0..height {
+                for x in 0..width {
+                    let src = ((width - 1 - x) * 16 + height - 1 - y) * 4;
+                    let dst = (y * width + x) * 4;
+                    // The crop's last chroma sample may interpolate differently
+                    // at its right edge. Alpha is independent of chroma resampling.
+                    assert_eq!(display.rgba[dst + 3], base.rgba[src + 3]);
+                    if y > 0 {
+                        assert_eq!(display.rgba[dst..dst + 3], base.rgba[src..src + 3]);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn accepts_compatible_brands_and_rejects_truncated_or_oversized_images() {
         assert!(is_avif(ALPHA));
         assert!(is_avif(b"\0\0\0\x14ftypmif1\0\0\0\0avif"));
