@@ -109,7 +109,23 @@ fn avc_sample_description(width: u32, height: u32, level: u8) -> Vec<u8> {
             sps.ue(x);
         }
     }
-    sps.bit(false); // no VUI
+    // VUI identifies square pixels and the matrix actually used below,
+    // including on HD displays whose default would otherwise be BT.709.
+    sps.bit(true);
+    sps.bit(true);
+    sps.unsigned(1, 8);
+    sps.bit(false);
+    sps.bit(true);
+    sps.unsigned(5, 3);
+    sps.bit(false);
+    sps.bit(true);
+    for value in [1, 13, 6] {
+        sps.unsigned(value, 8);
+    }
+    sps.bit(true);
+    sps.ue(1);
+    sps.ue(1);
+    sps.unsigned(0, 5);
     let mut pps = Bits::default();
     pps.ue(0);
     pps.ue(0);

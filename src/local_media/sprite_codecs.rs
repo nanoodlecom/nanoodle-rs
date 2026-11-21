@@ -2,6 +2,7 @@
 use super::{err, PngImage};
 use crate::Result;
 
+mod bmp;
 mod gif;
 mod png;
 mod video;
@@ -18,9 +19,13 @@ pub(super) fn decode_image(raw: &[u8]) -> Result<PngImage> {
         super::sprite_webp::decode_webp(raw)
     } else if raw.starts_with(b"GIF87a") || raw.starts_with(b"GIF89a") {
         gif::decode(raw)
+    } else if raw.starts_with(b"BM") {
+        bmp::decode_file(raw)
+    } else if raw.starts_with(&[0, 0, 1, 0]) || raw.starts_with(&[0, 0, 2, 0]) {
+        bmp::decode_icon(raw)
     } else {
         Err(err(
-            "Unsupported sprite image format; use PNG, JPEG, GIF or WebP.",
+            "Unsupported sprite image format; use PNG, JPEG, GIF, WebP, BMP or ICO.",
         ))
     }
 }
