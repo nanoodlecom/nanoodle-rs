@@ -1,6 +1,6 @@
 //! Read the active, static triangle scene of a self-contained glTF 2 asset.
 use super::{err, AlphaMode, Mesh, PngImage, Texture};
-use crate::local_media::data_url_bytes;
+use crate::local_media::{data_url_bytes, sniff_mime};
 use crate::Result;
 use serde_json::Value;
 use std::borrow::Cow;
@@ -143,6 +143,11 @@ fn embedded(uri: &Value) -> Result<Vec<u8>> {
     Ok(data_url_bytes(uri)?.0)
 }
 
+struct DecodedImage {
+    pixels: Rc<PngImage>,
+    is_webp: bool,
+}
+
 struct Document<'a> {
     json: Value,
     buffers: Vec<Cow<'a, [u8]>>,
@@ -154,15 +159,15 @@ impl<'a> Document<'a> {
         if json["asset"]["version"] != "2.0" {
             return Err(err("Expected glTF 2.0."));
         }
-        let extensions = items(&json["extensionsRequired"])?;
-        if !extensions.is_empty() {
-            let names = extensions
-                .iter()
-                .map(|v| v.as_str().unwrap_or("?"))
-                .collect::<Vec<_>>()
-                .join(", ");
+        let unsupported: Vec<_> = items(&json["extensionsRequired"])?
+            .iter()
+            .map(|name| name.as_str().unwrap_or("?"))
+            .filter(|&name| name != "EXT_texture_webp")
+            .collect();
+        if !unsupported.is_empty() {
             return Err(err(format!(
-                "Unsupported required glTF extensions: {names}"
+                "Unsupported required glTF extensions: {}",
+                unsupported.join(", ")
             )));
         }
         let mut buffers = Vec::new();
@@ -277,35 +282,57 @@ impl<'a> Document<'a> {
     fn texture(
         &self,
         info: &Value,
-        cache: &mut HashMap<usize, Rc<PngImage>>,
+        cache: &mut HashMap<usize, DecodedImage>,
         decode: &dyn Fn(&[u8]) -> Result<PngImage>,
     ) -> Result<Texture> {
         if !info["extensions"]["KHR_texture_transform"].is_null() {
             return Err(err("Unsupported base-color texture encoding or transform."));
         }
         let texture = get(&self.json["textures"], &info["index"])?;
-        let source = index(&texture["source"])?;
-        let image = if let Some(pixels) = cache.get(&source) {
-            Rc::clone(pixels)
-        } else {
-            let img = self.json["images"]
-                .get(source)
-                .ok_or_else(|| err("Missing glTF texture image."))?;
-            let pixels = if !img["uri"].is_null() {
-                decode(&embedded(&img["uri"])?)?
-            } else {
-                decode(self.view(&img["bufferView"])?.0)?
-            };
-            let n = (pixels.width as usize)
-                .checked_mul(pixels.height as usize)
-                .and_then(|n| n.checked_mul(4));
-            if n != Some(pixels.rgba.len()) || pixels.rgba.is_empty() {
-                return Err(err("Invalid texture dimensions."));
-            }
-            let pixels = Rc::new(pixels);
-            cache.insert(source, Rc::clone(&pixels));
-            pixels
+        let webp = texture["extensions"].get("EXT_texture_webp");
+        let source = match webp {
+            Some(ext) => unsigned(&ext["source"])
+                .filter(|&i| self.json["images"].get(i).is_some())
+                .ok_or_else(|| err("Invalid EXT_texture_webp image source."))?,
+            None => index(&texture["source"])?,
         };
+        let img = self.json["images"]
+            .get(source)
+            .ok_or_else(|| err("Missing glTF texture image."))?;
+        if webp.is_some() && !img["bufferView"].is_null() && img["mimeType"] != "image/webp" {
+            return Err(err("EXT_texture_webp bufferView requires image/webp."));
+        }
+        let invalid_webp = || err("EXT_texture_webp source must contain a WebP image.");
+        let decoded = match cache.entry(source) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let data = if !img["uri"].is_null() {
+                    Cow::Owned(embedded(&img["uri"])?)
+                } else {
+                    Cow::Borrowed(self.view(&img["bufferView"])?.0)
+                };
+                let is_webp = sniff_mime(&data) == "image/webp";
+                if webp.is_some() && !is_webp {
+                    return Err(invalid_webp());
+                }
+                let pixels = decode(&data)?;
+                let n = (pixels.width as usize)
+                    .checked_mul(pixels.height as usize)
+                    .and_then(|n| n.checked_mul(4));
+                if n != Some(pixels.rgba.len()) || pixels.rgba.is_empty() {
+                    return Err(err("Invalid texture dimensions."));
+                }
+                entry.insert(DecodedImage {
+                    pixels: Rc::new(pixels),
+                    is_webp,
+                })
+            }
+        };
+        // A core texture may already have decoded this index as a PNG or JPEG.
+        if webp.is_some() && !decoded.is_webp {
+            return Err(invalid_webp());
+        }
+        let image = Rc::clone(&decoded.pixels);
         let sampler = if texture["sampler"].is_null() {
             &Value::Null
         } else {
@@ -328,7 +355,7 @@ impl<'a> Document<'a> {
         &self,
         p: &Value,
         world: &Matrix,
-        cache: &mut HashMap<usize, Rc<PngImage>>,
+        cache: &mut HashMap<usize, DecodedImage>,
         decode: &dyn Fn(&[u8]) -> Result<PngImage>,
     ) -> Result<Mesh> {
         let mode = optional_index(&p["mode"], 4)?;
@@ -519,4 +546,134 @@ pub(super) fn parse(raw: &[u8], decode: &dyn Fn(&[u8]) -> Result<PngImage>) -> R
         return Err(err("No triangles in the selected glTF scene."));
     }
     Ok(meshes)
+}
+
+#[cfg(test)]
+mod webp_tests {
+    use super::*;
+    use serde_json::json;
+    use std::cell::Cell;
+
+    const WEBP: &str =
+        "data:image/webp;base64,UklGRh4AAABXRUJQVlA4TBEAAAAvAAAAAAdQkE40pf+BiOh/AAA=";
+    const FALLBACK: &str = "data:image/png;base64,iVBORw0KGgo=";
+
+    // Tag the selected bytes so these tests exercise the parser independently
+    // of the format-specific pixel decoders.
+    fn identify(bytes: &[u8]) -> Result<PngImage> {
+        Ok(PngImage {
+            width: 1,
+            height: 1,
+            rgba: vec![bytes[0], 0, 0, 255],
+        })
+    }
+
+    #[test]
+    fn webp_source_overrides_fallback_and_reuses_its_decoded_image() {
+        let spec = json!({
+            "asset":{"version":"2.0"},
+            "extensionsRequired":["EXT_texture_webp"],
+            "images":[{"uri":FALLBACK},{"uri":WEBP}],
+            "textures":[
+                {"source":0, "extensions":{"EXT_texture_webp":{"source":1}}},
+                {"extensions":{"EXT_texture_webp":{"source":1}}},
+                {"source":0}
+            ]
+        })
+        .to_string();
+        let doc = Document::open(spec.as_bytes()).unwrap();
+        let calls = Cell::new(0);
+        let decode = |raw: &[u8]| {
+            calls.set(calls.get() + 1);
+            identify(raw)
+        };
+        let mut cache = HashMap::new();
+        for (index, tag) in [(0, b'R'), (1, b'R'), (2, 0x89)] {
+            let result = doc
+                .texture(&json!({"index":index}), &mut cache, &decode)
+                .unwrap();
+            assert_eq!(result.image.rgba[0], tag);
+        }
+        assert_eq!(calls.get(), 2);
+        let unsupported=json!({"asset":{"version":"2.0"},"extensionsRequired":["EXT_texture_webp","EXT_meshopt_compression"]}).to_string();
+        let error = Document::open(unsupported.as_bytes()).err().unwrap();
+        assert_eq!(
+            error.0,
+            "Unsupported required glTF extensions: EXT_meshopt_compression"
+        );
+    }
+
+    #[test]
+    fn invalid_override_never_selects_a_core_or_cached_non_webp_image() {
+        let mut doc = Document {
+            json: json!({
+                "images":[{"uri":FALLBACK}],
+                "textures":[{"source":0},{"source":0,"extensions":{"EXT_texture_webp":{"source":0}}}]
+            }),
+            buffers: vec![],
+        };
+        let mut cache = HashMap::new();
+        doc.texture(&json!({"index":0}), &mut cache, &identify)
+            .unwrap();
+        let info = json!({"index":1});
+        assert!(doc
+            .texture(&info, &mut cache, &identify)
+            .err()
+            .unwrap()
+            .0
+            .contains("must contain a WebP"));
+        for bad in [
+            Value::Null,
+            json!({}),
+            json!({"source":-1}),
+            json!({"source":0.5}),
+            json!({"source":"0"}),
+            json!({"source":1}),
+        ] {
+            doc.json["textures"][1]["extensions"]["EXT_texture_webp"] = bad;
+            assert!(doc
+                .texture(&info, &mut cache, &identify)
+                .err()
+                .unwrap()
+                .0
+                .contains("image source"));
+        }
+    }
+
+    #[test]
+    fn embedded_buffer_view_checks_declared_webp_mime_and_signature() {
+        let raw = data_url_bytes(WEBP).unwrap().0;
+        let mut doc = Document {
+            json: json!({
+                "images":[{"bufferView":0,"mimeType":"image/png"}],
+                "textures":[{"extensions":{"EXT_texture_webp":{"source":0}}}],
+                "bufferViews":[{"buffer":0,"byteLength":raw.len()}]
+            }),
+            buffers: vec![Cow::Owned(raw)],
+        };
+        let info = json!({"index":0});
+        let mut cache = HashMap::new();
+        assert!(doc
+            .texture(&info, &mut cache, &identify)
+            .err()
+            .unwrap()
+            .0
+            .contains("requires image/webp"));
+        doc.json["images"][0]["mimeType"] = json!("image/webp");
+        assert_eq!(
+            doc.texture(&info, &mut cache, &identify)
+                .unwrap()
+                .image
+                .rgba[0],
+            b'R'
+        );
+        cache.clear();
+        doc.buffers[0].to_mut()[8] = b'X';
+        assert!(doc
+            .texture(&info, &mut cache, &identify)
+            .err()
+            .unwrap()
+            .0
+            .contains("must contain a WebP"));
+    }
 }
