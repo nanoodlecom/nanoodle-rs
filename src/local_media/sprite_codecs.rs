@@ -11,7 +11,7 @@ pub(super) use png::read_png;
 pub(super) use video::encode_turntable;
 
 pub(super) fn decode_image(raw: &[u8]) -> Result<PngImage> {
-    if raw.starts_with(b"\x89PNG\r\n\x1a\n") {
+    let image = if raw.starts_with(b"\x89PNG\r\n\x1a\n") {
         read_png(raw, true)
     } else if raw.starts_with(&[0xff, 0xd8]) {
         super::sprite_jpeg::decode_jpeg(raw)
@@ -27,7 +27,8 @@ pub(super) fn decode_image(raw: &[u8]) -> Result<PngImage> {
         Err(err(
             "Unsupported sprite image format; use PNG, JPEG, GIF, WebP, BMP or ICO.",
         ))
-    }
+    }?;
+    Ok(super::sprite_orientation::apply(raw, image))
 }
 
 fn dimensions(width: usize, height: usize, allow_strip: bool) -> Result<()> {
