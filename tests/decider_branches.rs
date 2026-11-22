@@ -166,16 +166,31 @@ fn shared_branch_fixture_and_legacy_round_trip() {
                 "{name}"
             );
         }
-        {
-            let mut state = script.lock().unwrap();
-            state.calls.clear();
-            state.answers = [json!(0)].into();
+        for branching in [false, true] {
+            {
+                let mut state = script.lock().unwrap();
+                state.calls.clear();
+                state.answers = [json!(0)].into();
+            }
+            let mut graph = fixture["legacy"].clone();
+            if branching {
+                graph["nodes"][1]["type"] = json!("decide-branch");
+                graph["links"][1]["from"]["port"] = json!("yes");
+            }
+            graph["nodes"].as_array_mut().unwrap().push(json!({
+                "id": "failed", "type": "image",
+                "fields": {"prompt": "draw a box", "onError": "skip"}
+            }));
+            let result = run(&materialize(&graph).unwrap(), &ctx)
+                .unwrap_or_else(|e| panic!("{}", e.message));
+            assert_eq!(result.nodes["n2"].status, if branching { "done" } else { "gated" });
+            assert_eq!(result.nodes["n4"].status, "skipped");
+            assert!(result.nodes["n4"].error.is_none());
+            assert_eq!(result.nodes["failed"].status, "skipped");
+            assert!(result.nodes["failed"].error.is_some());
+            assert!(result.outputs.is_empty());
+            assert_eq!(result.cost_usd, 0.001);
+            assert_eq!(script.lock().unwrap().calls, ["n2"]);
         }
-        let legacy: Value = serde_json::from_str(&fixture["legacy"].to_string()).unwrap();
-        let result = run(&materialize(&legacy).unwrap(), &ctx).ok().unwrap();
-        assert_eq!(result.nodes["n2"].status, "gated");
-        assert_eq!(result.nodes["n4"].status, "skipped");
-        assert_eq!(result.cost_usd, 0.001);
-        assert_eq!(script.lock().unwrap().calls, ["n2"]);
     });
 }

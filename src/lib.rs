@@ -94,7 +94,7 @@ fn node_type(ty: &str) -> Option<(&'static str, &'static [&'static str], &'stati
         "extractaudio" => ("Extract audio", &["video"][..], &["audio"][..]),
         "transcribe" => ("Transcribe", &["audio"][..], &["text"][..]),
         "cleanvoice" => ("Clean voice", &["audio", "video"][..], &["audio"][..]),
-        "endpoint" => ("Custom endpoint", &["text", "image", "audio", "video"][..], &["text"][..]),
+        "endpoint" => ("Custom endpoint", &["text", "image", "audio", "video"][..], &["text", "image", "audio", "video"][..]),
         "comment" => ("Comment", &[][..], &[][..]),
         _ => return None,
     })
@@ -1551,7 +1551,13 @@ fn gather_step<'a>(
             .cloned()
             .unwrap_or(Value::Null);
         inputs.insert(l.to_port.clone(), v.clone());
-        if !is_input_port(node, &l.to_port) && !(node.ty == "decide" && l.to_port == "branch") {
+        // The endpoint resolver needs the authored base URL and mode even
+        // when a wire supplies a relative path or leaves its mode blank.
+        let endpoint_route = node.ty == "endpoint" && matches!(l.to_port.as_str(), "url" | "mode");
+        if !is_input_port(node, &l.to_port)
+            && !endpoint_route
+            && !(node.ty == "decide" && l.to_port == "branch")
+        {
             effective
                 .get_or_insert_with(|| node.clone())
                 .fields
@@ -2113,14 +2119,28 @@ pub fn run(graph: &Graph, ctx: &Ctx) -> std::result::Result<RunResult, RunFailur
     let sink_ids: HashSet<String> = sinks.iter().map(|n| n.id.to_lowercase()).collect();
     let mut used: HashSet<String> = HashSet::new();
     let mut key_hints: HashMap<String, usize> = HashMap::new();
+    let mut error_skips = Vec::new();
     for n in &sinks {
         let key = unique_key(&n.display_name(), &mut used, &sink_ids, &n.id.to_lowercase(), &mut key_hints);
         let rec = match result.nodes.get(&n.id) {
             Some(r) if r.status == "done" || (r.status == "gated" && !r.out.is_empty()) => r,
+            Some(r) if r.status == "skipped" => {
+                if let Some(error) = &r.error {
+                    error_skips.push((key, error));
+                }
+                continue;
+            }
             _ => continue,
         };
         let (_, _, ports) = node_type(&n.ty).unwrap_or(("", &[], &[]));
-        if let Some(v) = rec.out.get(ports[0]) {
+        let value = if n.ty == "endpoint" {
+            // The endpoint runner emits the port for the resolved mode, which
+            // can come from a wire or route prefix as well as from a field.
+            ports.iter().find_map(|port| rec.out.get(*port))
+        } else {
+            rec.out.get(ports[0])
+        };
+        if let Some(v) = value {
             result.outputs.insert(key, v.clone());
             result.outputs.insert(n.id.clone(), v.clone());
         }
@@ -2129,8 +2149,6 @@ pub fn run(graph: &Graph, ctx: &Ctx) -> std::result::Result<RunResult, RunFailur
     // JS run() throws RunError when any sink (output) node errored — the
     // error CARRIES the result (records, outputs, cost), like JS/Py.
     // Non-sink errors are collected in result.errors and never throw.
-    // (The JS "every output skipped after failing" branch needs
-    // onError:"skip" settings, which this engine does not take yet.)
     for n in &graph.nodes {
         if has_outgoing.contains(n.id.as_str()) || n.ty == "comment" {
             continue;
@@ -2147,6 +2165,17 @@ pub fn run(graph: &Graph, ctx: &Ctx) -> std::result::Result<RunResult, RunFailur
                 });
             }
         }
+    }
+    if !sinks.is_empty() && error_skips.len() == sinks.len() {
+        let detail = error_skips
+            .into_iter()
+            .map(|(key, error)| format!("\"{key}\": {error}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(RunFailure {
+            message: format!("run failed — every output was skipped after failing: {detail}"),
+            result: Some(result),
+        });
     }
     Ok(result)
 }
