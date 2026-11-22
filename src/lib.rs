@@ -112,26 +112,26 @@ fn dynamic_input_name(port: &str) -> bool {
     port == "audio" || port == "endframe"
 }
 
-/// ^img\d+$ | ^image\d*$ | ^vid\d+$ | ^clip\d+$ | ^ref\d+$  (JS DYNAMIC_INPUT_RES;
+/// ^img\d*$ | ^image\d*$ | ^vid\d*$ | ^clip\d*$ | ^ref\d*$  (JS DYNAMIC_INPUT_RES;
 /// frame ports are deliberately NOT here — vframes wiring is handled apart).
 fn dynamic_input_re(port: &str) -> bool {
     fn digits(s: &str) -> bool {
         !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
     }
     if let Some(r) = port.strip_prefix("img") {
-        return digits(r);
+        return r.is_empty() || digits(r);
     }
     if let Some(r) = port.strip_prefix("image") {
         return r.is_empty() || digits(r);
     }
     if let Some(r) = port.strip_prefix("vid") {
-        return digits(r);
+        return r.is_empty() || digits(r);
     }
     if let Some(r) = port.strip_prefix("clip") {
-        return digits(r);
+        return r.is_empty() || digits(r);
     }
     if let Some(r) = port.strip_prefix("ref") {
-        return digits(r);
+        return r.is_empty() || digits(r);
     }
     false
 }
@@ -696,10 +696,10 @@ fn collect_img_ports(inputs: &HashMap<String, Value>) -> Vec<String> {
         .iter()
         .filter_map(|(k, v)| {
             let rest = k.strip_prefix("img")?;
-            if !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()) {
+            if rest.is_empty() || rest.bytes().all(|b| b.is_ascii_digit()) {
                 if let Value::String(s) = v {
                     if !s.is_empty() {
-                        return Some((rest.parse().unwrap_or(0), s));
+                        return Some((rest.parse().unwrap_or(1), s));
                     }
                 }
             }

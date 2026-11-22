@@ -2888,7 +2888,10 @@ pub fn run_vframes(node: &Node, inputs: &HashMap<String, Value>, _ctx: &Ctx) -> 
 fn clip_port_idx(port: &str) -> Option<(i64, bool)> {
     for (prefix, is_clip) in [("clip", true), ("vid", false)] {
         if let Some(rest) = port.strip_prefix(prefix) {
-            if !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()) {
+            if rest.is_empty() {
+                return Some((1, is_clip));
+            }
+            if rest.bytes().all(|b| b.is_ascii_digit()) {
                 return rest.parse::<i64>().ok().map(|n| (n, is_clip));
             }
         }

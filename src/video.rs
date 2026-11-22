@@ -123,13 +123,13 @@ fn video_dims(ctx: &Ctx, node: &Node) -> Map<String, Value> {
     out
 }
 
-/// Ports matching ^ref\d+$ in port order (JS collectPorts: trailing-number
+/// Ports matching ^ref\d*$ in port order (JS collectPorts: trailing-number
 /// index, default 1), values non-empty.
 fn collect_ref_ports(inputs: &HashMap<String, Value>) -> Vec<String> {
     let mut ports: Vec<(u32, String)> = Vec::new();
     for (k, v) in inputs.iter() {
         if let Some(rest) = k.strip_prefix("ref") {
-            if !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()) {
+            if rest.is_empty() || rest.bytes().all(|b| b.is_ascii_digit()) {
                 let s = value_text(v);
                 if !s.is_empty() {
                     ports.push((rest.parse().unwrap_or(1), s));
