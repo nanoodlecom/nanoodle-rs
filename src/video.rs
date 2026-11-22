@@ -364,6 +364,7 @@ struct VideoJob {
     sources: Map<String, Value>,
     refs: Vec<String>,
     is3d: bool,
+    want_assets: bool,
 }
 
 fn url_encode(s: &str) -> String {
@@ -441,6 +442,125 @@ fn model3d_status_url(s: &Value, model: &str) -> String {
         .unwrap_or_default()
 }
 
+/// S1: one labeled companion asset from a completed job's payload.
+pub struct StatusAsset {
+    pub label: String,
+    pub url: String,
+    pub kind: String,
+}
+
+fn asset_kind(content_type: &str, url: &str) -> String {
+    let ct = content_type.to_ascii_lowercase();
+    if ct.starts_with("image/") {
+        return "image".into();
+    }
+    if ct.starts_with("video/") || ct == "video/quicktime" {
+        return "video".into();
+    }
+    if ct.starts_with("audio/") {
+        return "audio".into();
+    }
+    if ct.contains("gltf") || ct.contains("model/") {
+        return "model3d".into();
+    }
+    let path = url.split(['?', '#']).next().unwrap_or("").to_ascii_lowercase();
+    let ext = path.rsplit('.').next().unwrap_or("");
+    match ext {
+        "glb" | "gltf" | "fbx" | "obj" | "stl" | "ply" | "usdz" | "3mf" => "model3d".into(),
+        "png" | "jpg" | "jpeg" | "webp" | "gif" | "avif" => "image".into(),
+        "mp4" | "mov" | "webm" | "mkv" => "video".into(),
+        "mp3" | "wav" | "ogg" | "flac" | "m4a" => "audio".into(),
+        _ => "file".into(),
+    }
+}
+
+/// JS parseStatusAssets: normalize output.model3d_assets[] +
+/// output.processing_assets[] to [{label, url, kind}].
+pub fn parse_status_assets(s: &Value) -> Vec<StatusAsset> {
+    let out = status_output(s);
+    let mut assets = Vec::new();
+    for key in ["model3d_assets", "processing_assets"] {
+        if let Some(Value::Array(list)) = out.get(key) {
+            for a in list {
+                let url = match js_str(a.get("url")) {
+                    Some(u) => u,
+                    None => continue,
+                };
+                let label = js_str(a.get("label"))
+                    .or_else(|| js_str(a.get("filename")))
+                    .unwrap_or_default();
+                let ct = a.get("contentType").map(value_text).unwrap_or_default();
+                let kind = asset_kind(&ct, &url);
+                assets.push(StatusAsset { label, url, kind });
+            }
+        }
+    }
+    assets
+}
+
+/// The assets JSON in the JS/Py shape — fixed key order (label, url, kind),
+/// no spaces — built by hand because serde_json::Map sorts its keys.
+fn assets_json(assets: &[StatusAsset]) -> String {
+    let parts: Vec<String> = assets
+        .iter()
+        .map(|a| {
+            format!(
+                "{{\"label\":{},\"url\":{},\"kind\":{}}}",
+                serde_json::to_string(&a.label).unwrap_or_default(),
+                serde_json::to_string(&a.url).unwrap_or_default(),
+                serde_json::to_string(&a.kind).unwrap_or_default()
+            )
+        })
+        .collect();
+    format!("[{}]", parts.join(","))
+}
+
+/// JS assetOutputs: role ports for companion assets. The `assets` port
+/// always carries the full list as JSON; canonical roles surface as URLs.
+/// First match wins per role; the primary never reappears as model2..N.
+pub fn asset_outputs(assets: &[StatusAsset], primary_url: &str, is3d: bool) -> Map<String, Value> {
+    let mut out = Map::new();
+    if assets.is_empty() {
+        return out;
+    }
+    out.insert("assets".into(), json!(assets_json(assets)));
+    let mut taken: Vec<bool> = vec![false; assets.len()];
+    let mut claim = |role: &str, out: &mut Map<String, Value>, test: &dyn Fn(&StatusAsset) -> bool| {
+        for (i, a) in assets.iter().enumerate() {
+            if !taken[i] && test(a) {
+                taken[i] = true;
+                out.insert(role.into(), json!(a.url));
+                return;
+            }
+        }
+    };
+    if is3d {
+        claim("depth", &mut out, &|a: &StatusAsset| a.kind == "image" && a.label.to_ascii_lowercase().contains("depth"));
+        claim("normals", &mut out, &|a: &StatusAsset| a.kind == "image" && a.label.to_ascii_lowercase().contains("normal"));
+        claim("mask", &mut out, &|a: &StatusAsset| a.kind == "image" && a.label.to_ascii_lowercase().contains("mask"));
+        claim("points", &mut out, &|a: &StatusAsset| {
+            a.label.to_ascii_lowercase().contains("point")
+                || a.url.to_ascii_lowercase().split(['?', '#']).next().unwrap_or("").ends_with(".ply")
+        });
+        let mut n = 2;
+        for (i, a) in assets.iter().enumerate() {
+            if a.kind != "model3d" || taken[i] || a.url == primary_url {
+                continue;
+            }
+            taken[i] = true;
+            out.insert(format!("model{}", n), json!(a.url));
+            n += 1;
+        }
+    } else {
+        claim("matte", &mut out, &|a: &StatusAsset| a.kind == "video" && a.label.to_ascii_lowercase().contains("matte"));
+        claim("cutout", &mut out, &|a: &StatusAsset| {
+            a.kind == "video"
+                && (a.label.to_ascii_lowercase().contains("cutout") || a.label.to_ascii_lowercase().contains("alpha"))
+        });
+    }
+    out
+}
+
 /// JS completed-video URL: (out.video && out.video.url) || out.url ||
 /// (Array.isArray(out.video) ? out.video[0].url : null).
 fn video_status_url(out: &Value) -> Option<String> {
@@ -483,7 +603,7 @@ fn error_status(msg: &str) -> Option<u16> {
 
 /// Submit + poll, mirroring JS client.video. Cost: JS fires onCost once, on
 /// the submit response — status responses never add cost.
-fn gen_video(ctx: &Ctx, job: VideoJob) -> std::result::Result<(String, Option<f64>), NodeError> {
+fn gen_video(ctx: &Ctx, job: VideoJob) -> std::result::Result<(String, Option<f64>, Map<String, Value>), NodeError> {
     let mut body = Map::new();
     body.insert("model".into(), json!(job.model));
     // 3D omits an empty prompt; video always sends it, blank included.
@@ -547,7 +667,7 @@ fn gen_video(ctx: &Ctx, job: VideoJob) -> std::result::Result<(String, Option<f6
         label,
         POLL_CAP.as_secs()
     );
-    let url = poll_loop(POLL_INTERVAL, POLL_CAP, timeout, || {
+    let (url, extras) = poll_loop(POLL_INTERVAL, POLL_CAP, timeout, || {
         let s = match ctx.get_json(&path) {
             Ok((s, _)) => s,
             Err(e) => {
@@ -570,16 +690,29 @@ fn gen_video(ctx: &Ctx, job: VideoJob) -> std::result::Result<(String, Option<f6
             .unwrap_or_default()
             .to_ascii_uppercase();
         if st == "COMPLETED" || st == "SUCCEEDED" {
+            // S1: jobs that ask also collect the payload's labeled companion
+            // assets as role outputs; everyone else gets an empty map.
+            let extras = |url: &str| {
+                if job.want_assets {
+                    asset_outputs(&parse_status_assets(&s), url, job.is3d)
+                } else {
+                    Map::new()
+                }
+            };
             if job.is3d {
                 let url = model3d_status_url(&s, &job.model);
                 if url.is_empty() {
                     return Ok(PollStep::Failed("completed but no model url".into()));
                 }
-                return Ok(PollStep::Done(url));
+                let ex = extras(&url);
+                return Ok(PollStep::Done((url, ex)));
             }
             let out = status_output(&s);
             return Ok(match video_status_url(&out) {
-                Some(url) => PollStep::Done(url),
+                Some(url) => {
+                    let ex = extras(&url);
+                    PollStep::Done((url, ex))
+                }
                 None => PollStep::Failed("completed but no video url".into()),
             });
         }
@@ -596,11 +729,11 @@ fn gen_video(ctx: &Ctx, job: VideoJob) -> std::result::Result<(String, Option<f6
         Ok(PollStep::Pending)
     })
     .map_err(|e| NodeError { message: e.0, cost })?;
-    Ok((url, cost))
+    Ok((url, cost, extras))
 }
 
-fn done(key: &str, url: String, cost: Option<f64>) -> NodeOutcome {
-    let mut out = Map::new();
+fn done(key: &str, url: String, extras: Map<String, Value>, cost: Option<f64>) -> NodeOutcome {
+    let mut out = extras;
     out.insert(key.into(), json!(url));
     NodeOutcome::Done(out, cost)
 }
@@ -613,7 +746,7 @@ pub fn run_tvideo(node: &Node, inputs: &HashMap<String, Value>, ctx: &Ctx) -> st
         return Err(NanoodleError("no prompt".into()).into());
     }
     let model = mdl(node)?;
-    let (url, cost) = gen_video(
+    let (url, cost, extras) = gen_video(
         ctx,
         VideoJob {
             dims: video_dims(ctx, node),
@@ -626,16 +759,17 @@ pub fn run_tvideo(node: &Node, inputs: &HashMap<String, Value>, ctx: &Ctx) -> st
             model,
             prompt,
             is3d: false,
+            want_assets: true,
         },
     )?;
-    Ok(done("video", url, cost))
+    Ok(done("video", url, extras, cost))
 }
 
 pub fn run_ivideo(node: &Node, inputs: &HashMap<String, Value>, ctx: &Ctx) -> std::result::Result<NodeOutcome, NodeError> {
     let image = input_text(inputs, "image")
         .ok_or_else(|| NanoodleError("no image input".into()))?;
     let model = mdl(node)?;
-    let (url, cost) = gen_video(
+    let (url, cost, extras) = gen_video(
         ctx,
         VideoJob {
             dims: video_dims(ctx, node),
@@ -648,9 +782,10 @@ pub fn run_ivideo(node: &Node, inputs: &HashMap<String, Value>, ctx: &Ctx) -> st
             model,
             prompt: prompt_raw(node, inputs),
             is3d: false,
+            want_assets: true,
         },
     )?;
-    Ok(done("video", url, cost))
+    Ok(done("video", url, extras, cost))
 }
 
 pub fn run_vedit(node: &Node, inputs: &HashMap<String, Value>, ctx: &Ctx) -> std::result::Result<NodeOutcome, NodeError> {
@@ -665,7 +800,7 @@ pub fn run_vedit(node: &Node, inputs: &HashMap<String, Value>, ctx: &Ctx) -> std
     } else {
         sources.insert("videoDataUrl".into(), json!(video));
     }
-    let (url, cost) = gen_video(
+    let (url, cost, extras) = gen_video(
         ctx,
         VideoJob {
             dims: video_dims(ctx, node),
@@ -679,9 +814,10 @@ pub fn run_vedit(node: &Node, inputs: &HashMap<String, Value>, ctx: &Ctx) -> std
             model,
             prompt: prompt_raw(node, inputs),
             is3d: false,
+            want_assets: true,
         },
     )?;
-    Ok(done("video", url, cost))
+    Ok(done("video", url, extras, cost))
 }
 
 /// JS model3dInputMods without a catalog: the two known defaults, everything
@@ -750,7 +886,7 @@ pub fn run_model3d(node: &Node, inputs: &HashMap<String, Value>, ctx: &Ctx) -> s
     if !mesh.is_empty() {
         extra.insert("model_url".into(), json!(mesh)); // the wire wins over a static modelOpts copy
     }
-    let (url, cost) = gen_video(
+    let (url, cost, extras) = gen_video(
         ctx,
         VideoJob {
             dims: Map::new(),
@@ -763,7 +899,75 @@ pub fn run_model3d(node: &Node, inputs: &HashMap<String, Value>, ctx: &Ctx) -> s
             model,
             prompt: if takes_text { prompt } else { String::new() },
             is3d: true,
+            want_assets: true,
         },
     )?;
-    Ok(done("model", url, cost))
+    Ok(done("model", url, extras, cost))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // S1 fixtures: trimmed copies of REAL 2026-11-21 NanoGPT payloads
+    // (Edge Styles Lab probes: moge3, alphagen, convert) — same fixtures as
+    // the JS assets-surfacing and Py test_assets_surfacing suites.
+    fn moge() -> Value {
+        json!({"data": {"status": "COMPLETED", "output": {
+            "kind": "3d", "format": "glb",
+            "model_url": "https://v3b.fal.media/files/b/0ab36d09/GLB_mesh.glb",
+            "model3d_assets": [
+                {"label": "Textured GLB", "filename": "mesh.glb", "url": "https://v3b.fal.media/files/b/0ab36d09/GLB_mesh.glb", "contentType": "model/gltf-binary"},
+                {"label": "Colored point cloud PLY", "filename": "pointcloud.ply", "url": "https://v3b.fal.media/files/b/0ab36d09/PC_pointcloud.ply", "contentType": "application/octet-stream"},
+                {"label": "Colorized depth map PNG", "filename": "depth.png", "url": "https://v3b.fal.media/files/b/0ab36d09/DEPTH.png", "contentType": "image/png"},
+                {"label": "Surface normals PNG", "filename": "normals.png", "url": "https://v3b.fal.media/files/b/0ab36d09/NORMALS.png", "contentType": "image/png"},
+                {"label": "Validity mask PNG", "filename": "mask.png", "url": "https://v3b.fal.media/files/b/0ab36d09/MASK.png", "contentType": "image/png"}
+            ]}}})
+    }
+
+    fn alphagen() -> Value {
+        json!({"data": {"status": "COMPLETED", "output": {
+            "video": {"url": "https://nano-gpt.com/v1/media/content?rid=abc"},
+            "processing_assets": [
+                {"label": "Alpha matte MP4", "filename": "matte.mp4", "url": "https://v3b.fal.media/files/b/0ab36d6e/MATTE_matte.mp4", "contentType": "video/mp4"},
+                {"label": "Straight-alpha ProRes 4444 MOV", "filename": "cutout.mov", "url": "https://v3b.fal.media/files/b/0ab36d6e/CUT_cutout.mov", "contentType": "video/quicktime"}
+            ]}}})
+    }
+
+    #[test]
+    fn parse_moge_assets_normalizes_kinds() {
+        let assets = parse_status_assets(&moge());
+        assert_eq!(assets.len(), 5);
+        let kinds: Vec<&str> = assets.iter().map(|a| a.kind.as_str()).collect();
+        assert_eq!(kinds, ["model3d", "model3d", "image", "image", "image"]);
+        assert_eq!(assets[1].label, "Colored point cloud PLY");
+        assert!(parse_status_assets(&json!({"data": {"output": {}}})).is_empty());
+    }
+
+    #[test]
+    fn moge_roles_land_and_primary_never_duplicates() {
+        let primary = "https://v3b.fal.media/files/b/0ab36d09/GLB_mesh.glb";
+        let out = asset_outputs(&parse_status_assets(&moge()), primary, true);
+        assert_eq!(out["depth"], json!("https://v3b.fal.media/files/b/0ab36d09/DEPTH.png"));
+        assert_eq!(out["normals"], json!("https://v3b.fal.media/files/b/0ab36d09/NORMALS.png"));
+        assert_eq!(out["mask"], json!("https://v3b.fal.media/files/b/0ab36d09/MASK.png"));
+        assert_eq!(out["points"], json!("https://v3b.fal.media/files/b/0ab36d09/PC_pointcloud.ply"));
+        assert!(!out.contains_key("model2"));
+        let parsed: Value = serde_json::from_str(out["assets"].as_str().unwrap()).unwrap();
+        assert_eq!(parsed.as_array().unwrap().len(), 5);
+        // JS/Py byte shape: label,url,kind order, no spaces
+        assert!(out["assets"].as_str().unwrap().starts_with("[{\"label\":"));
+    }
+
+    #[test]
+    fn alphagen_matte_and_cutout() {
+        let out = asset_outputs(
+            &parse_status_assets(&alphagen()),
+            "https://nano-gpt.com/v1/media/content?rid=abc",
+            false,
+        );
+        assert_eq!(out["matte"], json!("https://v3b.fal.media/files/b/0ab36d6e/MATTE_matte.mp4"));
+        assert_eq!(out["cutout"], json!("https://v3b.fal.media/files/b/0ab36d6e/CUT_cutout.mov"));
+        assert!(asset_outputs(&[], "x", false).is_empty());
+    }
 }
