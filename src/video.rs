@@ -10,7 +10,7 @@
 //! - Poll cadence is 10 ms with a 120 s cap (the Rust CLI has no knob flags);
 //!   JS defaults are 5 s / no deadline (25 min for 3D).
 
-use crate::{cat_item, input_text, poll_loop, value_text, Ctx, NanoodleError, Node, NodeError, NodeOutcome, PollStep, Result};
+use crate::{cat_item, input_text, value_text, Ctx, NanoodleError, Node, NodeError, NodeOutcome, PollStep, Result};
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::time::Duration;
@@ -462,25 +462,6 @@ fn video_status_url(out: &Value) -> Option<String> {
     None
 }
 
-/// HTTP status hidden in a Ctx error, if any (http_error formats generic
-/// failures as "{status}: {body}" and auth failures as "(HTTP {status})").
-fn error_status(msg: &str) -> Option<u16> {
-    let head: String = msg.chars().take(3).collect();
-    if msg.len() > 3
-        && head.len() == 3
-        && head.bytes().all(|b| b.is_ascii_digit())
-        && msg[3..].starts_with(": ")
-    {
-        return head.parse().ok();
-    }
-    if let Some(i) = msg.find("(HTTP ") {
-        let rest = &msg[i + 6..];
-        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-        return digits.parse().ok();
-    }
-    None
-}
-
 /// Submit + poll, mirroring JS client.video. Cost: JS fires onCost once, on
 /// the submit response — status responses never add cost.
 fn gen_video(ctx: &Ctx, job: VideoJob) -> std::result::Result<(String, Option<f64>), NodeError> {
@@ -526,7 +507,7 @@ fn gen_video(ctx: &Ctx, job: VideoJob) -> std::result::Result<(String, Option<f6
         body.insert("reference_images".into(), Value::Array(refs));
     }
 
-    let (j, cost) = ctx.post_json("/api/generate-video", &Value::Object(body))?;
+    let (j, cost) = ctx.post_billed_json("/api/generate-video", &Value::Object(body))?;
     let run_id = js_str(j.get("runId"))
         .or_else(|| js_str(j.get("id")))
         .or_else(|| {
@@ -547,20 +528,7 @@ fn gen_video(ctx: &Ctx, job: VideoJob) -> std::result::Result<(String, Option<f6
         label,
         POLL_CAP.as_secs()
     );
-    let url = poll_loop(POLL_INTERVAL, POLL_CAP, timeout, || {
-        let s = match ctx.get_json(&path) {
-            Ok((s, _)) => s,
-            Err(e) => {
-                // JS: a 4xx poll response (except 408/429) is terminal; any
-                // other failure is transient — stay in Pending until the cap.
-                if let Some(st) = error_status(&e.0) {
-                    if (400..500).contains(&st) && st != 408 && st != 429 {
-                        return Err(e);
-                    }
-                }
-                return Ok(PollStep::Pending);
-            }
-        };
+    let url = ctx.poll_json(&path, POLL_INTERVAL, POLL_CAP, timeout, |s| {
         let data = s.get("data");
         let st = data
             .and_then(|d| d.get("status"))
@@ -573,15 +541,15 @@ fn gen_video(ctx: &Ctx, job: VideoJob) -> std::result::Result<(String, Option<f6
             if job.is3d {
                 let url = model3d_status_url(&s, &job.model);
                 if url.is_empty() {
-                    return Ok(PollStep::Failed("completed but no model url".into()));
+                    return PollStep::Failed("completed but no model url".into());
                 }
-                return Ok(PollStep::Done(url));
+                return PollStep::Done(url);
             }
             let out = status_output(&s);
-            return Ok(match video_status_url(&out) {
+            return match video_status_url(&out) {
                 Some(url) => PollStep::Done(url),
                 None => PollStep::Failed("completed but no video url".into()),
-            });
+            };
         }
         if ["FAILED", "ERROR", "CANCELED", "CANCELLED", "CONTENT_POLICY_VIOLATION"]
             .contains(&st.as_str())
@@ -591,9 +559,9 @@ fn gen_video(ctx: &Ctx, job: VideoJob) -> std::result::Result<(String, Option<f6
                 .map(value_text)
                 .filter(|x| !x.is_empty())
                 .unwrap_or_else(|| st.clone());
-            return Ok(PollStep::Failed(format!("{} failed: {}", label, why)));
+            return PollStep::Failed(format!("{} failed: {}", label, why));
         }
-        Ok(PollStep::Pending)
+        PollStep::Pending
     })
     .map_err(|e| NodeError { message: e.0, cost })?;
     Ok((url, cost))
