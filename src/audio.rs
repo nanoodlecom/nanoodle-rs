@@ -11,7 +11,10 @@
 //! raw-body POST, so transcribe (like endpoint) drives its own ureq Agent
 //! against ctx.base_url with ctx.api_key.
 
-use crate::{input_text, model_of, poll_loop, value_text, Ctx, NanoodleError, Node, NodeError, NodeOutcome, PollStep, Result};
+use crate::{
+    decode_billed_json, http_error, input_text, model_of, read_billed_json, value_text, Ctx,
+    NanoodleError, Node, NodeError, NodeOutcome, NodeResult, PollStep, Result,
+};
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::time::Duration;
@@ -73,49 +76,6 @@ fn num_of(v: &Value) -> Option<f64> {
 
 fn num_field(n: &Node, key: &str) -> Option<f64> {
     n.fields.get(key).and_then(num_of)
-}
-
-/// JS httpError (client.mjs) — replicated because lib.rs keeps its copy private.
-fn http_error(status: u16, body: &str) -> NanoodleError {
-    if status == 401 || status == 403 {
-        return NanoodleError(format!(
-            "API key rejected (HTTP {}) — check your NanoGPT key / NANOGPT_API_KEY",
-            status
-        ));
-    }
-    let low = body.to_ascii_lowercase();
-    if status == 402
-        || ["insufficient", "balance", "funds", "not enough", "payment required"]
-            .iter()
-            .any(|k| low.contains(k))
-    {
-        return NanoodleError(
-            "out of balance — this run needs more credit. Top up at nano-gpt.com, then run again."
-                .into(),
-        );
-    }
-    NanoodleError(format!("{}: {}", status, body.chars().take(160).collect::<String>()))
-}
-
-/// Cost from a JSON body only (same priority as lib.rs cost_of minus the
-/// header fallback, which Ctx::post_bytes does not expose).
-fn cost_of_body(j: &Value) -> Option<f64> {
-    if let Some(c) = j.get("cost").and_then(|v| v.as_f64()) {
-        if c > 0.0 {
-            return Some(c);
-        }
-    }
-    if let Some(p) = j.get("x_nanogpt_pricing") {
-        for k in ["costUsd", "cost", "amount"] {
-            if let Some(c) = p.get(k).and_then(|v| v.as_f64()) {
-                return Some(c);
-            }
-        }
-    }
-    if let Some(c) = j.get("metadata").and_then(|m| m.get("cost")).and_then(|v| v.as_f64()) {
-        return Some(c);
-    }
-    j.get("cost").and_then(|v| v.as_f64())
 }
 
 const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -380,35 +340,18 @@ fn poll_audio(ctx: &Ctx, model: &str, j: &Value) -> Result<String> {
     }
     let path = format!("/api/tts/status?{}", qs);
     let cap = Duration::from_millis(300_000); // JS client default timeouts.audio
-    poll_loop(
+    ctx.poll_json(
+        &path,
         Duration::from_millis(50),
         cap,
         "audio timed out (300s) — the job may still be running on NanoGPT's side".into(),
-        || {
-            let s = match ctx.get_json(&path) {
-                Ok((s, _)) => s,
-                Err(e) => {
-                    // JS: transient poll failures keep polling; 4xx (except
-                    // 408/429) throw. get_json flattens status into the message.
-                    let msg = e.0.clone();
-                    let status: Option<u32> = msg
-                        .split(':')
-                        .next()
-                        .and_then(|p| p.trim().parse::<u32>().ok());
-                    match status {
-                        Some(st) if (400..500).contains(&st) && st != 408 && st != 429 => {
-                            return Err(e)
-                        }
-                        _ => return Ok(PollStep::Pending),
-                    }
-                }
-            };
+        |s| {
             let st = s
                 .get("status")
                 .map(value_text)
                 .unwrap_or_default()
                 .to_ascii_lowercase();
-            Ok(match st.as_str() {
+            match st.as_str() {
                 "completed" | "succeeded" => {
                     let url = s
                         .get("audioUrl")
@@ -433,7 +376,7 @@ fn poll_audio(ctx: &Ctx, model: &str, j: &Value) -> Result<String> {
                     PollStep::Failed(format!("audio failed: {}", why))
                 }
                 _ => PollStep::Pending,
-            })
+            }
         },
     )
 }
@@ -473,14 +416,12 @@ fn gen_audio(
         body.remove("prompt");
     }
     let (status, ctype, bytes, header_cost) =
-        ctx.post_bytes(SPEECH_PATH, &Value::Object(body.clone()))?;
+        ctx.post_billed_bytes(SPEECH_PATH, &Value::Object(body.clone()))?;
     if !(200..300).contains(&status) {
         return Err(http_error(status, &String::from_utf8_lossy(&bytes)).into());
     }
     if ctype.to_ascii_lowercase().contains("application/json") {
-        let j: Value = serde_json::from_slice(&bytes)
-            .map_err(|e| NanoodleError(format!("invalid JSON response: {}", e)))?;
-        let cost = cost_of_body(&j);
+        let (j, cost) = decode_billed_json(&bytes, header_cost)?;
         let url = j
             .get("url")
             .or_else(|| j.get("audioUrl"))
@@ -604,7 +545,7 @@ fn transcribe(
     model: &str,
     audio_url: &str,
     language: &str,
-) -> Result<(String, Option<f64>)> {
+) -> NodeResult<(String, Option<f64>)> {
     let (bytes, mime) = if audio_url.to_ascii_lowercase().starts_with("data:") {
         data_url_bytes(audio_url)?
     } else {
@@ -620,7 +561,7 @@ fn transcribe(
                         return Err(NanoodleError(format!(
                             "couldn't download the audio to transcribe ({})",
                             status
-                        )));
+                        )).into());
                     }
                     let ct = resp
                         .headers()
@@ -647,7 +588,7 @@ fn transcribe(
                 return Err(NanoodleError(format!(
                     "couldn't download the audio to transcribe: {}",
                     last_err
-                )))
+                )).into())
             }
         }
     };
@@ -655,7 +596,7 @@ fn transcribe(
         return Err(NanoodleError(
             "this clip is too big to transcribe directly (~3.5 MB max) — nanoodle sends audio inline; use a shorter clip"
                 .into(),
-        ));
+        ).into());
     }
     let ext = {
         let part = mime.split('/').nth(1).unwrap_or("mp3");
@@ -697,40 +638,13 @@ fn transcribe(
 
     let url = format!("{}/api/v1/audio/transcriptions", ctx.base_url);
     let agent = raw_agent();
-    let mut resp = agent
+    let resp = agent
         .post(&url)
         .header("Authorization", &format!("Bearer {}", ctx.api_key))
         .header("Content-Type", &format!("multipart/form-data; boundary={}", boundary))
         .send(body.as_slice())
         .map_err(|e| NanoodleError(format!("request failed: {}", e)))?;
-    let status = resp.status().as_u16();
-    let pricing = resp
-        .headers()
-        .get("x-nanogpt-pricing")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
-    let text = resp
-        .body_mut()
-        .read_to_string()
-        .map_err(|e| NanoodleError(format!("response read failed: {}", e)))?;
-    if !(200..300).contains(&status) {
-        return Err(http_error(status, &text));
-    }
-    let j: Value = serde_json::from_str(&text)
-        .map_err(|e| NanoodleError(format!("invalid JSON response: {}", e)))?;
-    let mut cost = cost_of_body(&j);
-    if cost.is_none() {
-        if let Some(h) = pricing.as_deref() {
-            if let Ok(p) = serde_json::from_str::<Value>(h) {
-                for k in ["costUsd", "cost", "amount"] {
-                    if let Some(c) = p.get(k).and_then(|v| v.as_f64()) {
-                        cost = Some(c);
-                        break;
-                    }
-                }
-            }
-        }
-    }
+    let (j, cost) = read_billed_json(resp)?;
     let txt = j
         .get("transcription")
         .or_else(|| j.get("text"))
@@ -740,11 +654,15 @@ fn transcribe(
         .map(value_text);
     match txt {
         Some(t) => Ok((t, cost)),
-        None => Err(NanoodleError("no transcription in response".into())),
+        None => Err(NodeError { message: "no transcription in response".into(), cost }),
     }
 }
 
 pub fn run_transcribe(n: &Node, i: &HashMap<String, Value>, c: &Ctx) -> Result<NodeOutcome> {
+    run_billed_transcribe(n, i, c).map_err(|e| NanoodleError(e.message))
+}
+
+pub(crate) fn run_billed_transcribe(n: &Node, i: &HashMap<String, Value>, c: &Ctx) -> NodeResult<NodeOutcome> {
     let audio = input_text(i, "audio")
         .ok_or_else(|| NanoodleError("no audio input".into()))?;
     let model = mdl(n)?;

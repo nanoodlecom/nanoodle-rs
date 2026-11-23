@@ -16,6 +16,9 @@ pub mod local_media;
 pub mod render3d;
 pub mod video;
 
+#[cfg(test)]
+mod provider_tests;
+
 // ---------------------------------------------------------------- errors
 
 #[derive(Debug)]
@@ -58,6 +61,7 @@ impl fmt::Display for NanoodleError {
 impl std::error::Error for NanoodleError {}
 
 pub type Result<T> = std::result::Result<T, NanoodleError>;
+type NodeResult<T> = std::result::Result<T, NodeError>;
 
 // ---------------------------------------------------------------- registry
 
@@ -401,15 +405,13 @@ pub fn topo_sort(graph: &Graph) -> Result<Vec<String>> {
 
 // ---------------------------------------------------------------- http ctx
 
-/// Execution context: where NanoGPT lives + the key. One ureq Agent = one
-/// keep-alive connection pool (the fanout lesson from BENCHMARKS.md).
 /// One classification of an async job's status response. Every NanoGPT
 /// long-running job (video, 3D, audio, lipsync) is the same implicit state
 /// machine — submit → poll → (Pending)* → Done | Failed — with transient poll
 /// errors (network, 5xx, 408, 429) staying in Pending and terminal 4xx
 /// failing fast. The families used to hand-roll this loop three times; now
-/// each step() classifies a single response and `poll_loop` owns the shared
-/// machine: cadence, deadline, timeout error.
+/// each classifier handles a single successful response and the shared loop
+/// owns the cadence and deadline.
 pub enum PollStep<T> {
     Pending,
     Done(T),
@@ -423,13 +425,27 @@ pub fn poll_loop<T>(
     timeout: String,
     mut step: impl FnMut() -> Result<PollStep<T>>,
 ) -> Result<T> {
+    poll_with_remaining(interval, cap, timeout, |_| step())
+}
+
+fn poll_with_remaining<T>(
+    interval: Duration,
+    cap: Duration,
+    timeout: String,
+    mut step: impl FnMut(Duration) -> Result<PollStep<T>>,
+) -> Result<T> {
     let start = Instant::now();
     loop {
-        std::thread::sleep(interval);
+        std::thread::sleep(interval.min(cap.saturating_sub(start.elapsed())));
+        let remaining = cap.saturating_sub(start.elapsed());
+        if remaining.is_zero() {
+            return Err(NanoodleError(timeout));
+        }
+        let update = step(remaining);
         if start.elapsed() >= cap {
             return Err(NanoodleError(timeout));
         }
-        match step()? {
+        match update? {
             PollStep::Pending => continue,
             PollStep::Done(v) => return Ok(v),
             PollStep::Failed(m) => return Err(NanoodleError(m)),
@@ -448,6 +464,7 @@ pub fn cat_item<'a>(catalog: &'a Value, kind: &str, id: &str) -> Option<&'a Valu
         .find(|m| m.get("id").and_then(|v| v.as_str()) == Some(id))
 }
 
+/// Execution context holding the NanoGPT URL, key and pooled HTTP agent.
 pub struct Ctx {
     pub base_url: String,
     pub api_key: String,
@@ -471,45 +488,45 @@ impl Ctx {
         }
     }
 
-    /// POST JSON, mirroring JS client.httpError + costWithHeaders behavior.
-    /// Returns (parsed body, cost USD if known).
-    pub fn post_json(&self, path: &str, body: &Value) -> Result<(Value, Option<f64>)> {
+    fn post_response(&self, path: &str, body: &Value) -> Result<ureq::http::Response<ureq::Body>> {
         let url = format!("{}{}", self.base_url, path);
-        let mut resp = self
-            .agent
+        self.agent
             .post(&url)
             .header("Authorization", &format!("Bearer {}", self.api_key))
             .header("Content-Type", "application/json")
             .send_json(body)
-            .map_err(|e| NanoodleError(format!("request failed: {}", e)))?;
-        let status = resp.status().as_u16();
-        let pricing_header = resp
-            .headers()
-            .get("x-nanogpt-pricing")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
-        let text = resp
-            .body_mut()
-            .read_to_string()
-            .map_err(|e| NanoodleError(format!("response read failed: {}", e)))?;
-        if !(200..300).contains(&status) {
-            return Err(http_error(status, &text));
-        }
-        let j: Value = serde_json::from_str(&text)
-            .map_err(|e| NanoodleError(format!("invalid JSON response: {}", e)))?;
-        let cost = cost_of(&j, pricing_header.as_deref());
-        Ok((j, cost))
+            .map_err(|e| NanoodleError(format!("request failed: {}", e)))
     }
 
-    /// GET JSON (video status polling). Returns (parsed body, cost if known).
-    pub fn get_json(&self, path: &str) -> Result<(Value, Option<f64>)> {
+    fn get_response(
+        &self,
+        path: &str,
+        timeout: Option<Duration>,
+    ) -> Result<ureq::http::Response<ureq::Body>> {
         let url = format!("{}{}", self.base_url, path);
-        let mut resp = self
-            .agent
+        self.agent
             .get(&url)
             .header("Authorization", &format!("Bearer {}", self.api_key))
+            .config()
+            .timeout_global(timeout)
+            .build()
             .call()
-            .map_err(|e| NanoodleError(format!("request failed: {}", e)))?;
+            .map_err(|e| NanoodleError(format!("request failed: {}", e)))
+    }
+
+    /// POST JSON, mirroring JS client.httpError + costWithHeaders behavior.
+    /// Returns (parsed body, cost USD if known).
+    pub fn post_json(&self, path: &str, body: &Value) -> Result<(Value, Option<f64>)> {
+        self.post_billed_json(path, body).map_err(|e| NanoodleError(e.message))
+    }
+
+    fn post_billed_json(&self, path: &str, body: &Value) -> NodeResult<(Value, Option<f64>)> {
+        read_billed_json(self.post_response(path, body)?)
+    }
+
+    /// GET JSON. Returns (parsed body, cost if known).
+    pub fn get_json(&self, path: &str) -> Result<(Value, Option<f64>)> {
+        let mut resp = self.get_response(path, None)?;
         let status = resp.status().as_u16();
         let text = resp
             .body_mut()
@@ -524,45 +541,96 @@ impl Ctx {
         Ok((j, cost))
     }
 
+    fn poll_json<T>(
+        &self,
+        path: &str,
+        interval: Duration,
+        cap: Duration,
+        timeout: String,
+        mut classify: impl FnMut(Value) -> PollStep<T>,
+    ) -> Result<T> {
+        poll_with_remaining(interval, cap, timeout, |remaining| {
+            let Ok(mut response) = self.get_response(path, Some(remaining)) else {
+                return Ok(PollStep::Pending);
+            };
+            let status = response.status().as_u16();
+            match status {
+                200..=299 => Ok(response
+                    .body_mut()
+                    .read_json::<Value>()
+                    .map(&mut classify)
+                    .unwrap_or(PollStep::Pending)),
+                // The HTTP status alone explains these failures, even if the
+                // server leaves the error body incomplete.
+                401 | 402 | 403 => Err(http_error(status, "")),
+                400..=499 if !matches!(status, 408 | 429) => {
+                    let text = response.body_mut().read_to_string().unwrap_or_default();
+                    Err(http_error(status, &text))
+                }
+                _ => Ok(PollStep::Pending),
+            }
+        })
+    }
+
     /// POST raw bytes with an explicit content type (TTS/music return audio
     /// bytes; callers that need them use this). Returns (status, content-type,
-    /// bytes, cost) — cost comes from the x-nanogpt-pricing header when the
-    /// body is binary (JS reads it there too).
+    /// bytes, cost). Binary responses report price in the headers.
     pub fn post_bytes(&self, path: &str, body: &Value) -> Result<(u16, String, Vec<u8>, Option<f64>)> {
-        let url = format!("{}{}", self.base_url, path);
-        let mut resp = self
-            .agent
-            .post(&url)
-            .header("Authorization", &format!("Bearer {}", self.api_key))
-            .header("Content-Type", "application/json")
-            .send_json(body)
-            .map_err(|e| NanoodleError(format!("request failed: {}", e)))?;
-        let status = resp.status().as_u16();
-        let ctype = resp
-            .headers()
-            .get("Content-Type")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string();
-        let pricing_header = resp
-            .headers()
-            .get("x-nanogpt-pricing")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
-        let bytes = resp
-            .body_mut()
-            .read_to_vec()
-            .map_err(|e| NanoodleError(format!("response read failed: {}", e)))?;
-        let cost = pricing_header
-            .as_deref()
-            .and_then(|h| serde_json::from_str::<Value>(h).ok())
-            .and_then(|p| {
-                ["costUsd", "cost", "amount"]
-                    .iter()
-                    .find_map(|k| p.get(k).and_then(|v| v.as_f64()))
-            });
-        Ok((status, ctype, bytes, cost))
+        self.post_billed_bytes(path, body).map_err(|e| NanoodleError(e.message))
     }
+
+    fn post_billed_bytes(
+        &self,
+        path: &str,
+        body: &Value,
+    ) -> NodeResult<(u16, String, Vec<u8>, Option<f64>)> {
+        read_provider_body(self.post_response(path, body)?)
+    }
+}
+
+/// Read price headers before consuming a body that might fail mid-stream.
+fn read_provider_body(
+    mut response: ureq::http::Response<ureq::Body>,
+) -> NodeResult<(u16, String, Vec<u8>, Option<f64>)> {
+    let status = response.status().as_u16();
+    let headers = response.headers();
+    let content_type = headers
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let header_cost = headers
+        .get("x-nanogpt-pricing")
+        .and_then(|value| serde_json::from_slice(value.as_bytes()).ok())
+        .and_then(|pricing| pricing_cost(&pricing))
+        .or_else(|| {
+            ["x-cost", "x-nano-cost"].iter().find_map(|key| {
+                let amount = headers.get(*key)?.to_str().ok()?.trim().parse::<f64>().ok()?;
+                amount.is_finite().then_some(amount)
+            })
+        });
+    let bytes = response.body_mut().read_to_vec().map_err(|error| NodeError {
+        message: format!("response read failed: {error}"),
+        cost: if (200..300).contains(&status) { header_cost } else { None },
+    })?;
+    Ok((status, content_type, bytes, header_cost))
+}
+
+fn read_billed_json(response: ureq::http::Response<ureq::Body>) -> NodeResult<(Value, Option<f64>)> {
+    let (status, _, bytes, header_cost) = read_provider_body(response)?;
+    if !(200..300).contains(&status) {
+        return Err(http_error(status, &String::from_utf8_lossy(&bytes)).into());
+    }
+    decode_billed_json(&bytes, header_cost)
+}
+
+fn decode_billed_json(bytes: &[u8], header_cost: Option<f64>) -> NodeResult<(Value, Option<f64>)> {
+    let json = serde_json::from_slice(bytes).map_err(|error| NodeError {
+        message: format!("invalid JSON response: {error}"),
+        cost: header_cost,
+    })?;
+    let cost = cost_of(&json, header_cost);
+    Ok((json, cost))
 }
 
 fn http_error(status: u16, body: &str) -> NanoodleError {
@@ -586,22 +654,22 @@ fn http_error(status: u16, body: &str) -> NanoodleError {
     NanoodleError(format!("{}: {}", status, body.chars().take(160).collect::<String>()))
 }
 
+fn pricing_cost(pricing: &Value) -> Option<f64> {
+    ["costUsd", "cost", "amount"].iter()
+        .find_map(|key| pricing.get(key).and_then(Value::as_f64))
+}
+
 /// USD cost priority (JS costFromJson): j.cost (>0) → x_nanogpt_pricing.
 /// (costUsd|cost|amount) → metadata.cost → j.cost even when 0 → header pricing.
-fn cost_of(j: &Value, pricing_header: Option<&str>) -> Option<f64> {
+fn cost_of(j: &Value, header_cost: Option<f64>) -> Option<f64> {
     let num = |v: &Value| v.as_f64();
     if let Some(c) = j.get("cost").and_then(num) {
         if c > 0.0 {
             return Some(c);
         }
     }
-    let from_pricing = |p: &Value| {
-        ["costUsd", "cost", "amount"]
-            .iter()
-            .find_map(|k| p.get(k).and_then(num))
-    };
     if let Some(p) = j.get("x_nanogpt_pricing") {
-        if let Some(c) = from_pricing(p) {
+        if let Some(c) = pricing_cost(p) {
             return Some(c);
         }
     }
@@ -611,12 +679,7 @@ fn cost_of(j: &Value, pricing_header: Option<&str>) -> Option<f64> {
     if let Some(c) = j.get("cost").and_then(num) {
         return Some(c);
     }
-    if let Some(h) = pricing_header {
-        if let Ok(p) = serde_json::from_str::<Value>(h) {
-            return from_pricing(&p);
-        }
-    }
-    None
+    header_cost
 }
 
 // ---------------------------------------------------------------- engine
@@ -658,11 +721,11 @@ fn run_node(
     ctx: &Ctx,
 ) -> std::result::Result<NodeOutcome, NodeError> {
     match node.ty.as_str() {
-        "llm" => run_llm(node, inputs, ctx).map_err(Into::into),
-        "vision" => run_vision(node, inputs, ctx).map_err(Into::into),
+        "llm" => run_llm(node, inputs, ctx),
+        "vision" => run_vision(node, inputs, ctx),
         "decide" => run_decide(node, inputs, ctx),
-        "image" => run_image(node, inputs, ctx).map_err(Into::into),
-        "edit" => run_edit(node, inputs, ctx).map_err(Into::into),
+        "image" => run_image(node, inputs, ctx),
+        "edit" => run_edit(node, inputs, ctx),
         "tvideo" => video::run_tvideo(node, inputs, ctx),
         "ivideo" => video::run_ivideo(node, inputs, ctx),
         "vedit" => video::run_vedit(node, inputs, ctx),
@@ -670,7 +733,7 @@ fn run_node(
         "music" => audio::run_music(node, inputs, ctx),
         "tts" => audio::run_tts(node, inputs, ctx),
         "remix" => audio::run_remix(node, inputs, ctx),
-        "transcribe" => audio::run_transcribe(node, inputs, ctx).map_err(Into::into),
+        "transcribe" => audio::run_billed_transcribe(node, inputs, ctx),
         "cleanvoice" => audio::run_cleanvoice(node, inputs, ctx),
         "endpoint" => endpoint::run_endpoint(node, inputs, ctx).map_err(Into::into),
         "slice-3d" | "sprite-stack-render" => local_media::run_sprite(node, inputs).map_err(Into::into),
@@ -681,7 +744,7 @@ fn run_node(
         "soundtrack" => local_media::run_soundtrack(node, inputs, ctx).map_err(Into::into),
         "trim" => local_media::run_trim(node, inputs, ctx).map_err(Into::into),
         "extractaudio" => local_media::run_extractaudio(node, inputs, ctx).map_err(Into::into),
-        "inpaint" => local_media::run_inpaint(node, inputs, ctx).map_err(Into::into),
+        "inpaint" => local_media::run_billed_inpaint(node, inputs, ctx),
         "lipsync" => local_media::run_lipsync(node, inputs, ctx),
         _ => run_local_node(node, inputs)
             .map(|out| NodeOutcome::Done(out, Some(0.0)))
@@ -738,7 +801,7 @@ fn chat(
     reasoning_effort: Option<&str>,
     show_thinking: bool,
     max_tokens: Option<i64>,
-) -> Result<(String, Option<f64>)> {
+) -> NodeResult<(String, Option<f64>)> {
     let mut body = json!({ "model": model, "messages": messages });
     // max_tokens only when the caller explicitly opted in (D1 ruling:
     // default-off, honored exactly when set — mirrors JS llmOpts / Py _run_llm).
@@ -756,7 +819,7 @@ fn chat(
             body["reasoning_effort"] = json!(e);
         }
     }
-    let (j, cost) = ctx.post_json("/api/v1/chat/completions", &body)?;
+    let (j, cost) = ctx.post_billed_json("/api/v1/chat/completions", &body)?;
     let msg = j
         .get("choices")
         .and_then(|c| c.get(0))
@@ -771,7 +834,7 @@ fn chat(
             .map(|p| p.get("text").and_then(|t| t.as_str()).unwrap_or(""))
             .collect::<Vec<_>>()
             .join(""),
-        _ => return Err(NanoodleError("no text in response".into())),
+        _ => return Err(NodeError { message: "no text in response".into(), cost }),
     };
     if show_thinking {
         if let Some(r) = msg.get("reasoning").and_then(|r| r.as_str()) {
@@ -785,7 +848,7 @@ fn run_llm(
     node: &Node,
     inputs: &HashMap<String, Value>,
     ctx: &Ctx,
-) -> Result<NodeOutcome> {
+) -> NodeResult<NodeOutcome> {
     let prompt = prompt_of(node, inputs)
         .ok_or_else(|| NanoodleError("no prompt".into()))?;
     let imgs = collect_img_ports(inputs);
@@ -840,7 +903,7 @@ fn run_vision(
     node: &Node,
     inputs: &HashMap<String, Value>,
     ctx: &Ctx,
-) -> Result<NodeOutcome> {
+) -> NodeResult<NodeOutcome> {
     let img = input_text(inputs, "image")
         .ok_or_else(|| NanoodleError("no image input".into()))?;
     let q = node.field_str("q").unwrap_or_default();
@@ -1024,9 +1087,9 @@ fn run_decide(
         }
         Value::Array(parts)
     };
-    let send = |state: Value| -> Result<(Value, Option<f64>)> {
+    let send = |state: Value| -> NodeResult<(Value, Option<f64>)> {
         let body = json!({ "model": model, "state": state, "questions": { "answer": q } });
-        let (j, c) = ctx.post_json("/api/v1/decisions", &body)?;
+        let (j, c) = ctx.post_billed_json("/api/v1/decisions", &body)?;
         // Standard cost extraction first (same as every other family); the
         // decisions API also reports usage.cost — keep it as a fallback.
         // (Was: usage.cost only, which silently dropped top-level cost.)
@@ -1044,7 +1107,12 @@ fn run_decide(
             let (j1, c1) = send(state_for(&fwd))?;
             // A failed second send still billed the first (JS onCost per send).
             let (j2, c2) = send(state_for(&rev))
-                .map_err(|e| NodeError { message: e.0, cost: c1 })?;
+                .map_err(|mut e| {
+                    if let Some(first_cost) = c1 {
+                        e.cost = Some(first_cost + e.cost.unwrap_or_default());
+                    }
+                    e
+                })?;
             let probs_of = |j: &Value| -> Map<String, Value> {
                 j.pointer("/answers/answer/probabilities")
                     .and_then(|p| p.as_object())
@@ -1101,7 +1169,7 @@ fn run_decide(
             let ans = j
                 .pointer("/answers/answer")
                 .cloned()
-                .ok_or_else(|| NanoodleError("the decision model returned no answer".into()))?;
+                .ok_or_else(|| NodeError { message: "the decision model returned no answer".into(), cost: c })?;
             let (t, im) = match mode {
                 "choose" => (
                     ans.get("choice").and_then(|v| v.as_str()).unwrap_or("").to_string(),
@@ -1216,7 +1284,7 @@ fn gen_image(
     mask_data_url: Option<&str>,
     extra: Map<String, Value>,
     n: i64,
-) -> Result<(Vec<String>, Option<f64>)> {
+) -> NodeResult<(Vec<String>, Option<f64>)> {
     let (urls, _layers, cost) =
         gen_image_full(ctx, model, prompt, size, image_data_url, mask_data_url, extra, n)?;
     Ok((urls, cost))
@@ -1231,7 +1299,7 @@ fn gen_image_full(
     mask_data_url: Option<&str>,
     extra: Map<String, Value>,
     n: i64,
-) -> Result<(Vec<String>, Option<Vec<Value>>, Option<f64>)> {
+) -> NodeResult<(Vec<String>, Option<Vec<Value>>, Option<f64>)> {
     let mut body = Map::new();
     body.insert("model".into(), json!(model));
     body.insert("size".into(), json!(if size.is_empty() { "1024x1024" } else { size }));
@@ -1251,7 +1319,7 @@ fn gen_image_full(
     for (k, v) in extra {
         body.insert(k, v);
     }
-    let (j, cost) = ctx.post_json("/v1/images/generations", &Value::Object(body))?;
+    let (j, cost) = ctx.post_billed_json("/v1/images/generations", &Value::Object(body))?;
     let mut urls = Vec::new();
     let mut layers: Vec<Value> = Vec::new();
     if let Some(data) = j.get("data").and_then(|d| d.as_array()) {
@@ -1268,7 +1336,7 @@ fn gen_image_full(
         }
     }
     if urls.is_empty() {
-        return Err(NanoodleError("no image in response".into()));
+        return Err(NodeError { message: "no image in response".into(), cost });
     }
     let layers = if layers.iter().any(|l| !l.is_null()) { Some(layers) } else { None };
     Ok((urls, layers, cost))
@@ -1287,7 +1355,7 @@ fn gen_image_items(
     mask_data_url: Option<&str>,
     extra: Map<String, Value>,
     n: i64,
-) -> Result<(Vec<String>, Option<Vec<Value>>, Option<f64>)> {
+) -> NodeResult<(Vec<String>, Option<Vec<Value>>, Option<f64>)> {
     gen_image_full(ctx, model, prompt, size, image_data_url, mask_data_url, extra, n)
 }
 
@@ -1339,7 +1407,7 @@ fn run_image(
     node: &Node,
     inputs: &HashMap<String, Value>,
     ctx: &Ctx,
-) -> Result<NodeOutcome> {
+) -> NodeResult<NodeOutcome> {
     let prompt = prompt_of(node, inputs)
         .ok_or_else(|| NanoodleError("no prompt".into()))?;
     let want: i64 = node
@@ -1373,14 +1441,14 @@ fn run_edit(
     node: &Node,
     inputs: &HashMap<String, Value>,
     ctx: &Ctx,
-) -> Result<NodeOutcome> {
+) -> NodeResult<NodeOutcome> {
     let imgs = collect_edit_ports(inputs);
     if imgs.is_empty() {
-        return Err(NanoodleError("no image input".into()));
+        return Err(NanoodleError("no image input".into()).into());
     }
     let prompt = prompt_of(node, inputs).unwrap_or_default();
     if prompt.is_empty() {
-        return Err(NanoodleError("no edit instruction".into()));
+        return Err(NanoodleError("no edit instruction".into()).into());
     }
     let src = if imgs.len() > 1 {
         json!(imgs)

@@ -12,7 +12,10 @@
 //! Outputs are data: URLs. Local nodes cost Some(0.0); inpaint/lipsync bill
 //! through the API like their JS twins.
 
-use crate::{input_text, mdl, multi_image_out, prompt_of, value_text, Ctx, NanoodleError, Node, NodeError, NodeOutcome, Result};
+use crate::{
+    input_text, mdl, multi_image_out, prompt_of, value_text, Ctx, NanoodleError, Node, NodeError,
+    NodeOutcome, NodeResult, PollStep, Result,
+};
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::io::Read;
@@ -2512,7 +2515,7 @@ fn gen_image_local(
     prompt: &str,
     image_data_url: Option<&str>,
     mask_data_url: Option<&str>,
-) -> Result<(Vec<String>, Option<Vec<Value>>, Option<f64>)> {
+) -> NodeResult<(Vec<String>, Option<Vec<Value>>, Option<f64>)> {
     let model = mdl(node)?;
     let size = node.field_str("size").filter(|s| !s.is_empty()).unwrap_or_else(|| "1024x1024".to_string());
     let mut body = Map::new();
@@ -2538,7 +2541,7 @@ fn gen_image_local(
     for (k, v) in extra {
         body.insert(k, v);
     }
-    let (j, cost) = ctx.post_json("/v1/images/generations", &Value::Object(body))?;
+    let (j, cost) = ctx.post_billed_json("/v1/images/generations", &Value::Object(body))?;
     let mut urls: Vec<String> = Vec::new();
     let mut layers: Vec<Value> = Vec::new();
     if let Some(data) = j.get("data").and_then(|d| d.as_array()) {
@@ -2574,7 +2577,7 @@ fn gen_image_local(
         }
     }
     if urls.is_empty() {
-        return Err(err("no image in response"));
+        return Err(NodeError { message: "no image in response".into(), cost });
     }
     let layers = if layers.iter().any(|l| !l.is_null()) { Some(layers) } else { None };
     Ok((urls, layers, cost))
@@ -2595,15 +2598,6 @@ fn url_encode_component(s: &str) -> String {
         }
     }
     out
-}
-
-fn http_status_prefix(msg: &str) -> Option<u32> {
-    let b = msg.as_bytes();
-    if b.len() >= 4 && b[0].is_ascii_digit() && b[1].is_ascii_digit() && b[2].is_ascii_digit() && b[3] == b':' {
-        msg[..3].parse().ok()
-    } else {
-        None
-    }
 }
 
 /// client.video mirror: submit + poll /api/video/status until terminal.
@@ -2632,7 +2626,7 @@ fn gen_video_local(
     for (k, v) in extra {
         body.insert(k.clone(), v.clone());
     }
-    let (j, cost) = ctx.post_json("/api/generate-video", &Value::Object(body))?;
+    let (j, cost) = ctx.post_billed_json("/api/generate-video", &Value::Object(body))?;
     // Everything after the submit carries its cost (JS bills at submit).
     let billed = |msg: String| NodeError { message: msg, cost };
     let run_id = match j.get("runId").or_else(|| j.get("id")) {
@@ -2643,54 +2637,41 @@ fn gen_video_local(
         return Err(billed("no runId returned".into()));
     }
     let path = format!("/api/video/status?requestId={}", url_encode_component(&run_id));
-    let deadline = Instant::now() + Duration::from_secs(3600);
-    loop {
-        std::thread::sleep(Duration::from_millis(400));
-        let sj = match ctx.get_json(&path) {
-            Ok((v, _)) => v,
-            Err(e) => {
-                // transient poll errors are swallowed; client errors are not
-                if let Some(s) = http_status_prefix(&e.0) {
-                    if (400..500).contains(&s) && s != 408 && s != 429 {
-                        return Err(billed(e.0));
+    let timeout = "video timed out (3600s) — the job may still finish; check NanoGPT history";
+    let url = ctx.poll_json(
+        &path,
+        Duration::from_millis(400),
+        Duration::from_secs(3600),
+        timeout.into(),
+        |sj| {
+            let data = sj.get("data").filter(|d| d.is_object()).unwrap_or(&sj);
+            let st = data
+                .get("status")
+                .or_else(|| sj.get("status"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_ascii_uppercase();
+            match st.as_str() {
+                "COMPLETED" | "SUCCEEDED" => {
+                    let out = data.get("output").or_else(|| sj.get("output")).unwrap_or(&Value::Null);
+                    match extract_video_url(out) {
+                        Some(u) => PollStep::Done(u),
+                        None => PollStep::Failed("completed but no video url".into()),
                     }
                 }
-                if Instant::now() > deadline {
-                    return Err(billed("video timed out (3600s) — the job may still finish; check NanoGPT history".into()));
+                "FAILED" | "ERROR" | "CANCELED" | "CANCELLED" | "CONTENT_POLICY_VIOLATION" => {
+                    let detail = data
+                        .get("error")
+                        .map(value_text)
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or(st);
+                    PollStep::Failed(format!("video failed: {}", detail))
                 }
-                continue;
+                _ => PollStep::Pending,
             }
-        };
-        let data = sj.get("data").filter(|d| d.is_object()).cloned().unwrap_or_else(|| sj.clone());
-        let st = data
-            .get("status")
-            .or_else(|| sj.get("status"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_ascii_uppercase();
-        match st.as_str() {
-            "COMPLETED" | "SUCCEEDED" => {
-                let out = data.get("output").cloned().or_else(|| sj.get("output").cloned()).unwrap_or(Value::Null);
-                let url = extract_video_url(&out);
-                return match url {
-                    Some(u) => Ok((u, cost)),
-                    None => Err(billed("completed but no video url".into())),
-                };
-            }
-            "FAILED" | "ERROR" | "CANCELED" | "CANCELLED" | "CONTENT_POLICY_VIOLATION" => {
-                let detail = data
-                    .get("error")
-                    .map(|v| value_text(v))
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or_else(|| st.clone());
-                return Err(billed(format!("video failed: {}", detail)));
-            }
-            _ => {}
-        }
-        if Instant::now() > deadline {
-            return Err(billed("video timed out (3600s) — the job may still finish; check NanoGPT history".into()));
-        }
-    }
+        },
+    ).map_err(|e| billed(e.0))?;
+    Ok((url, cost))
 }
 
 fn extract_video_url(out: &Value) -> Option<String> {
@@ -2985,13 +2966,17 @@ fn wired_or_field(node: &Node, inputs: &HashMap<String, Value>, key: &str) -> St
 }
 
 pub fn run_inpaint(node: &Node, inputs: &HashMap<String, Value>, ctx: &Ctx) -> Result<NodeOutcome> {
+    run_billed_inpaint(node, inputs, ctx).map_err(|e| NanoodleError(e.message))
+}
+
+pub(crate) fn run_billed_inpaint(node: &Node, inputs: &HashMap<String, Value>, ctx: &Ctx) -> NodeResult<NodeOutcome> {
     let source = wired_or_field(node, inputs, "image");
     if source.is_empty() {
-        return Err(err("no image — supply the image to repaint"));
+        return Err(err("no image — supply the image to repaint").into());
     }
     let mask = wired_or_field(node, inputs, "mask");
     if mask.is_empty() {
-        return Err(err("no mask — supply a B/W mask (white = repaint)"));
+        return Err(err("no mask — supply a B/W mask (white = repaint)").into());
     }
     let prompt = prompt_of(node, inputs)
         .map(|s| s.trim().to_string())
