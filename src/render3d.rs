@@ -294,10 +294,14 @@ pub fn run_render3d(node: &Node, inputs: &HashMap<String, Value>, _ctx: &Ctx) ->
     let video = if field_str(node, "mode").as_deref() == Some("video") {
         let fps = field_f64(node, "fps", 24.0).round();
         let duration = field_f64(node, "duration", 2.0);
-        let frames = ((fps * duration).round() as u64).max(2);
+        let requested_frames = fps * duration;
+        let frames = requested_frames.round() as u64;
         if !(1.0..=60.0).contains(&fps) || !(0.1..=10.0).contains(&duration) ||
             frames > 240 || width * height * frames > 200_000_000 || width % 2 != 0 || height % 2 != 0 {
             return Err(err("render3d video needs even dimensions, 1–60 fps, 0.1–10 seconds, at most 240 frames and 200 million pixels"));
+        }
+        if requested_frames < 1.0 {
+            return Err(err("render3d video duration must be at least one frame at the selected fps"));
         }
         Some((fps as u32, duration, frames))
     } else { None };
@@ -332,7 +336,8 @@ fn render_with(node: &Node, exe: &PathBuf, port: u16, base: &Value, video: Optio
     let has_anim = base.get("animClip").is_some();
     let base_az = base.get("azimuth").and_then(|v| v.as_f64()).unwrap_or(35.0);
     for i in 0..frames {
-        let t = i as f64 / (frames - 1) as f64;
+        // A single-frame clip shows the start of each sweep.
+        let t = if frames == 1 { 0.0 } else { i as f64 / (frames - 1) as f64 };
         let mut f = base.clone();
         let obj = f.as_object_mut().expect("scene fields object");
         if turntable != 0.0 {
@@ -397,15 +402,20 @@ mod tests {
     #[test]
     fn render_budgets_are_checked_before_loading_the_model() {
         let ctx = Ctx::new("https://example.invalid", "fixture");
-        let input = HashMap::from([("model".into(), json!("https://example.invalid/model.glb"))]);
+        let input = HashMap::from([("model".into(), json!("file:///unused-model.glb"))]);
         for (value, expected) in [
             (json!({"width": 2049}), "dimensions"),
             (json!({"mode": "video", "fps": 60, "duration": 10}), "240 frames"),
             (json!({"mode": "video", "width": 319}), "even dimensions"),
+            (json!({"mode": "video", "fps": 1, "duration": 0.1}), "at least one frame"),
         ] {
             let node = Node { id: "r".into(), ty: "render3d".into(), name: None, fields: value.as_object().unwrap().clone(), unknown: false };
             let result = run_render3d(&node, &input, &ctx);
-            assert!(matches!(result, Err(e) if e.0.contains(expected)));
+            match result {
+                Err(error) if error.0.contains(expected) => {},
+                Err(error) => panic!("expected {expected:?}, got {error}"),
+                Ok(_) => panic!("expected {expected:?}, unexpectedly rendered a frame"),
+            }
         }
     }
 
@@ -566,14 +576,38 @@ mod tests {
         assert!(cr + cb < (red + blue) * 3 / 4, "clip cuts: {} vs {}", cr + cb, red + blue);
     }
 
+    fn has_video_encoder() -> bool {
+        let Ok(encoders) = Command::new("ffmpeg").args(["-hide_banner", "-encoders"]).output() else {
+            return false;
+        };
+        String::from_utf8_lossy(&encoders.stdout).split_whitespace().any(|s| s == "libx264")
+    }
+
+    #[test]
+    fn render3d_video_quantizes_duration_to_whole_frames() {
+        if !has_video_encoder() || Command::new("ffprobe").arg("-version").output().is_err() { return; }
+        let dir = TempDir::new().unwrap();
+        let output = dir.path("short.mp4");
+        for (fps, requested, frames, duration) in [(1, 1.0, "1", 1.0), (4, 0.25, "1", 0.25), (4, 0.375, "2", 0.5)] {
+            let fields = json!({"mode": "video", "width": 96, "height": 64,
+                "fps": fps, "duration": requested, "turntable": 180, "clipSweep": true, "clipAxis": "x"});
+            let Some(mp4) = render(fields.as_object().unwrap().clone(), "video") else { return };
+            std::fs::write(&output, mp4).unwrap();
+            let probe = Command::new("ffprobe").args(["-v", "error", "-select_streams", "v:0",
+                "-count_frames", "-show_entries", "stream=nb_read_frames,duration", "-of", "json"])
+                .arg(&output).output().unwrap();
+            assert!(probe.status.success(), "{}", String::from_utf8_lossy(&probe.stderr));
+            let info: Value = serde_json::from_slice(&probe.stdout).unwrap();
+            let stream = &info["streams"][0];
+            assert_eq!(stream["nb_read_frames"], frames, "{requested}s at {fps} fps");
+            let measured: f64 = stream["duration"].as_str().unwrap().parse().unwrap();
+            assert!((measured - duration).abs() < 1e-6, "{requested}s at {fps} fps: measured {measured}, expected {duration}");
+        }
+    }
+
     #[test]
     fn render3d_video_contains_successive_turntable_frames() {
-        let Ok(encoders) = Command::new("ffmpeg").args(["-hide_banner", "-encoders"]).output() else {
-            return;
-        };
-        if !String::from_utf8_lossy(&encoders.stdout).split_whitespace().any(|s| s == "libx264") {
-            return;
-        }
+        if !has_video_encoder() { return; }
         let fields = json!({"mode": "video", "width": 96, "height": 64,
             "fps": 12, "duration": 1, "turntable": 180});
         let Some(mp4) = render(fields.as_object().unwrap().clone(), "video") else { return };
