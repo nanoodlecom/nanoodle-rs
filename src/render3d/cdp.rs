@@ -22,6 +22,12 @@ fn remaining(deadline: Instant) -> io::Result<Duration> {
     Ok(time)
 }
 
+fn startup_timeout(phase: &str) -> NanoodleError {
+    err(format!(
+        "render3d: Chromium startup timed out during {phase}"
+    ))
+}
+
 // Apply the absolute deadline to each socket read/write, including a Chrome
 // response split across several TCP packets or WebSocket frames.
 struct DeadlineSocket {
@@ -52,19 +58,37 @@ impl Write for DeadlineSocket {
 struct Cdp {
     socket: WebSocket<DeadlineSocket>,
     id: u64,
+    startup_limited: bool,
 }
 
 impl Cdp {
-    fn transport_error(&self, error: tungstenite::Error) -> NanoodleError {
-        if Instant::now() >= self.socket.get_ref().deadline {
+    fn timeout(&self, method: &str) -> NanoodleError {
+        if self.startup_limited {
+            startup_timeout(method)
+        } else {
             err(TIMEOUT_MESSAGE)
+        }
+    }
+
+    fn check_deadline(&self, method: &str) -> Result<()> {
+        remaining(self.socket.get_ref().deadline)
+            .map(|_| ())
+            .map_err(|_| self.timeout(method))
+    }
+
+    fn transport_error(&self, method: &str, error: tungstenite::Error) -> NanoodleError {
+        if Instant::now() >= self.socket.get_ref().deadline
+            || matches!(&error, tungstenite::Error::Io(e)
+                if matches!(e.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock))
+        {
+            self.timeout(method)
         } else {
             err(format!("render3d: Chromium connection failed: {error}"))
         }
     }
 
     fn send(&mut self, method: &str, params: Value, session: Option<&str>) -> Result<Value> {
-        remaining(self.socket.get_ref().deadline).map_err(|_| err(TIMEOUT_MESSAGE))?;
+        self.check_deadline(method)?;
         self.id += 1;
         let mut request = json!({"id": self.id, "method": method, "params": params});
         if let Some(session) = session {
@@ -72,13 +96,13 @@ impl Cdp {
         }
         self.socket
             .send(Message::text(request.to_string()))
-            .map_err(|error| self.transport_error(error))?;
+            .map_err(|error| self.transport_error(method, error))?;
         loop {
-            remaining(self.socket.get_ref().deadline).map_err(|_| err(TIMEOUT_MESSAGE))?;
+            self.check_deadline(method)?;
             let message = self
                 .socket
                 .read()
-                .map_err(|error| self.transport_error(error))?;
+                .map_err(|error| self.transport_error(method, error))?;
             let Message::Text(text) = message else {
                 continue;
             };
@@ -90,7 +114,7 @@ impl Cdp {
             if let Some(error) = response.pointer("/error/message").and_then(Value::as_str) {
                 return Err(err(format!("render3d: {method}: {error}")));
             }
-            remaining(self.socket.get_ref().deadline).map_err(|_| err(TIMEOUT_MESSAGE))?;
+            self.check_deadline(method)?;
             return Ok(response["result"].take());
         }
     }
@@ -123,6 +147,14 @@ impl Chromium {
     pub(super) fn open(exe: &Path, profile: &Path, port: u16, deadline: Instant) -> Result<Self> {
         remaining(deadline).map_err(|_| err(TIMEOUT_MESSAGE))?;
         let startup_deadline = deadline.min(Instant::now() + STARTUP_LIMIT);
+        let startup_limited = startup_deadline < deadline;
+        let connect_timeout = |phase| {
+            if startup_limited {
+                startup_timeout(phase)
+            } else {
+                err(TIMEOUT_MESSAGE)
+            }
+        };
         let mut profile_arg = std::ffi::OsString::from("--user-data-dir=");
         profile_arg.push(profile);
         let child = Command::new(exe)
@@ -152,10 +184,15 @@ impl Chromium {
             session: String::new(),
         };
         let (address, path) = browser.endpoint(profile, startup_deadline, deadline)?;
-        let time = remaining(startup_deadline)
-            .map_err(|_| err("render3d: Chromium did not start in time"))?;
-        let stream = TcpStream::connect_timeout(&address, time)
-            .map_err(|error| err(format!("render3d: could not reach Chromium: {error}")))?;
+        let time =
+            remaining(startup_deadline).map_err(|_| connect_timeout("DevTools TCP connection"))?;
+        let stream = TcpStream::connect_timeout(&address, time).map_err(|error| {
+            if error.kind() == io::ErrorKind::TimedOut {
+                connect_timeout("DevTools TCP connection")
+            } else {
+                err(format!("render3d: could not reach Chromium: {error}"))
+            }
+        })?;
         let config = WebSocketConfig::default()
             .max_message_size(Some(MAX_MESSAGE))
             .max_frame_size(Some(MAX_MESSAGE));
@@ -167,8 +204,18 @@ impl Chromium {
             },
             Some(config),
         )
-        .map_err(|error| err(format!("render3d: could not connect to Chromium: {error}")))?;
-        browser.cdp = Some(Cdp { socket, id: 0 });
+        .map_err(|error| {
+            if Instant::now() >= startup_deadline {
+                connect_timeout("DevTools WebSocket handshake")
+            } else {
+                err(format!("render3d: could not connect to Chromium: {error}"))
+            }
+        })?;
+        browser.cdp = Some(Cdp {
+            socket,
+            id: 0,
+            startup_limited,
+        });
         let cdp = browser.cdp.as_mut().expect("Chromium connected");
         // A newly created target can belong to Chromium's dormant regular
         // context. Navigate the incognito page started by our command line.
@@ -183,6 +230,7 @@ impl Chromium {
             .ok_or_else(|| err("render3d: Chromium did not attach to the target"))?
             .into();
         cdp.socket.get_mut().deadline = deadline;
+        cdp.startup_limited = false;
         let url = format!("http://127.0.0.1:{port}/scene.html");
         let navigation = browser.command("Page.navigate", json!({"url": url}))?;
         if navigation["isDownload"] == true {
@@ -234,7 +282,7 @@ impl Chromium {
                 if Instant::now() >= deadline {
                     err(TIMEOUT_MESSAGE)
                 } else {
-                    err("render3d: Chromium did not start in time")
+                    startup_timeout("DevTools endpoint discovery")
                 }
             })?;
             std::thread::sleep(Duration::from_millis(20).min(time));
@@ -335,5 +383,48 @@ impl Drop for Chromium {
         }
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+    use tungstenite::protocol::Role;
+
+    #[test]
+    fn stalled_cdp_commands_report_the_deadline_in_use() {
+        for (method, startup_limited, expected) in [
+            (
+                "Target.getTargets",
+                true,
+                "render3d: Chromium startup timed out during Target.getTargets",
+            ),
+            (
+                "Target.attachToTarget",
+                true,
+                "render3d: Chromium startup timed out during Target.attachToTarget",
+            ),
+            ("Runtime.evaluate", false, TIMEOUT_MESSAGE),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let (_unresponsive_peer, _) = listener.accept().unwrap();
+            let socket = WebSocket::from_raw_socket(
+                DeadlineSocket {
+                    stream,
+                    deadline: Instant::now() + Duration::from_millis(40),
+                },
+                Role::Client,
+                None,
+            );
+            let mut cdp = Cdp {
+                socket,
+                id: 0,
+                startup_limited,
+            };
+            let error = cdp.send(method, json!({}), None).unwrap_err();
+            assert_eq!(error.0, expected);
+        }
     }
 }

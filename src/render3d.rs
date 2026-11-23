@@ -425,7 +425,11 @@ mod tests {
         let ctx = Ctx::new("https://example.invalid", "fixture");
         let node = Node { id: "r".into(), ty: "render3d".into(), name: None, fields: Map::new(), unknown: false };
         let bad = HashMap::from([("model".into(), json!("data:model/gltf-binary;base64,YmFk"))]);
-        assert!(matches!(run_render3d(&node, &bad, &ctx), Err(e) if e.0.contains("did not produce a frame")));
+        match run_render3d(&node, &bad, &ctx) {
+            Err(error) if error.0.contains("did not produce a frame") => {}
+            Err(error) => panic!("expected malformed model failure, got {error}"),
+            Ok(_) => panic!("malformed model unexpectedly produced a frame"),
+        }
         let asset = TcpListener::bind("127.0.0.1:0").unwrap();
         asset.set_nonblocking(true).unwrap();
         let glb = two_cube_glb();

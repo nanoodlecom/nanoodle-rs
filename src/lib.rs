@@ -1695,10 +1695,6 @@ fn gather_step<'a>(
     }
     let mut inputs: HashMap<String, Value> = HashMap::new();
     let mut effective: Option<Node> = None;
-    // Match the JS effective fields before applying any incoming field wires.
-    if let Some(floor) = frame_floor.filter(|&floor| floor > local_media::vframes_count(node)) {
-        effective.get_or_insert_with(|| node.clone()).fields.insert("frames".into(), json!(floor));
-    }
     let mut failed: Option<String> = None;
     let mut skipped_err: Vec<String> = Vec::new();
     let mut skipped_in = 0usize;
@@ -1771,10 +1767,12 @@ fn gather_step<'a>(
             return Gathered::InputError(issue);
         }
     }
-    Gathered::Ready {
-        node: effective.unwrap_or_else(|| node.clone()),
-        inputs,
+    let mut effective = effective.unwrap_or_else(|| node.clone());
+    // Outgoing frame wires set a minimum on the resolved count, including a wired count.
+    if let Some(floor) = frame_floor.filter(|&floor| floor > local_media::vframes_count(&effective)) {
+        effective.fields.insert("frames".into(), json!(floor));
     }
+    Gathered::Ready { node: effective, inputs }
 }
 
 /// Execute a gathered step: returns (record, out, blocks_downstream, error).

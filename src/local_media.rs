@@ -3052,9 +3052,15 @@ mod vframes_tests {
         assert!(encoded.status.success(), "{}", String::from_utf8_lossy(&encoded.stderr));
         let video = data_url_from_file(&clip, Some("video/mp4")).unwrap();
 
-        for (requested, expected) in [(13, 13), (1, 48)] {
-            let port = format!("frame{expected}");
-            let graph = materialize(&json!({
+        for (requested, wired_count, output, expected) in [
+            (13, None, 13, 13),
+            (1, None, 48, 48),
+            (1, Some("1"), 3, 3),
+            (8, Some("2"), 3, 3),
+            (1, Some("5"), 3, 5),
+        ] {
+            let port = format!("frame{output}");
+            let mut data = json!({
                 "nodes": [
                     {"id": "source", "type": "vupload", "fields": {"video": video}},
                     {"id": "frames", "type": "vframes",
@@ -3067,7 +3073,17 @@ mod vframes_tests {
                     {"from": {"node": "frames", "port": port},
                         "to": {"node": "sink", "port": "image"}},
                 ],
-            })).unwrap();
+            });
+            if let Some(count) = wired_count {
+                data["nodes"].as_array_mut().unwrap().push(json!({
+                    "id": "count", "type": "text", "fields": {"text": count},
+                }));
+                data["links"].as_array_mut().unwrap().push(json!({
+                    "from": {"node": "count", "port": "text"},
+                    "to": {"node": "frames", "port": "frames"},
+                }));
+            }
+            let graph = materialize(&data).unwrap();
             let result = run(&graph, &Ctx::new("", "")).unwrap_or_else(|e| panic!("{}", e.message));
             let frames = &result.nodes["frames"].out;
             assert_eq!(frames.len(), expected);
