@@ -8,13 +8,13 @@ use std::{
     time::Duration,
 };
 
-fn mock_endpoint(content_type: &str, body: &str, check: impl FnOnce(String)) {
+fn mock_endpoint(content_type: &str, body: &str, check: impl FnOnce(String)) -> bool {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     thread::scope(|scope| {
-        let (_keep_accepting, stop) = mpsc::channel::<()>();
-        scope.spawn(move || {
+        let (keep_accepting, stop) = mpsc::channel::<()>();
+        let responder = scope.spawn(move || {
             let mut stream = loop {
                 match listener.accept() {
                     Ok((stream, _)) => break stream,
@@ -22,7 +22,7 @@ fn mock_endpoint(content_type: &str, body: &str, check: impl FnOnce(String)) {
                         if stop.recv_timeout(Duration::from_millis(5)).is_err_and(|e| {
                             e == mpsc::RecvTimeoutError::Disconnected
                         }) {
-                            return;
+                            return false;
                         }
                     }
                     Err(e) => panic!("{e}"),
@@ -49,9 +49,12 @@ fn mock_endpoint(content_type: &str, body: &str, check: impl FnOnce(String)) {
             }
             io::copy(&mut reader.take(size), &mut io::sink()).unwrap();
             write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            true
         });
         check(base);
-    });
+        drop(keep_accepting);
+        responder.join().unwrap()
+    })
 }
 
 #[test]
@@ -129,6 +132,100 @@ fn custom_endpoint_sinks_emit_the_effective_output_port() {
             assert_eq!(result.outputs["sink"], expected);
             assert_eq!(result.outputs["Result"], expected);
         });
+    }
+}
+
+#[test]
+fn invalid_source_wire_warns_and_stops_before_requesting_a_provider() {
+    let requested = mock_endpoint(
+        "application/json",
+        r#"{"choices":[{"message":{"content":"called unexpectedly"}}]}"#,
+        |base| {
+            let graph = materialize(&json!({
+                "nodes": [
+                    {"id": "source", "type": "text", "fields": {"text": "upstream"}},
+                    {"id": "sink", "type": "endpoint", "fields": {
+                        "url": format!("{base}/generate"), "mode": "chat", "prompt": "authored prompt"
+                    }},
+                ],
+                "links": [{
+                    "from": {"node": "source", "port": "obsoletePort"},
+                    "to": {"node": "sink", "port": "mode"},
+                }],
+            })).unwrap();
+            let diagnostic = "wire source.obsoletePort → sink.mode uses undeclared source port \"obsoletePort\" on Text";
+            assert_eq!(graph.links[0].from_port, "obsoletePort");
+            assert_eq!(graph.warnings, [diagnostic]);
+            let failure = run(&graph, &Ctx::new(&base, "offline-fixture")).unwrap_err();
+            assert_eq!(failure.message, diagnostic);
+            assert!(failure.result.is_none());
+        },
+    );
+    assert!(!requested);
+}
+
+#[test]
+fn source_wire_validation_preserves_structurally_possible_and_legacy_ports() {
+    for (ty, port) in [
+        ("audio", "audio"),
+        ("decide-branch", "yes"),
+        ("decide", "decision"),
+        ("vframes", "frame48"),
+        ("endpoint", "audio"),
+        ("endpoint", "images"),
+        ("image", "images"),
+        ("edit", "layers"),
+        ("inpaint", "layers"),
+        ("render3d", "video"),
+        ("slice-3d", "layout"),
+        ("sprite-stack-render", "video"),
+    ] {
+        let graph = materialize(&json!({
+            "nodes": [
+                {"id": "source", "type": ty, "fields": {"mode": "chat"}},
+                {"id": "sink", "type": "text"},
+            ],
+            "links": [{
+                "from": {"node": "source", "port": port},
+                "to": {"node": "sink", "port": "text"},
+            }],
+        })).unwrap();
+        assert!(graph.warnings.is_empty(), "{ty}.{port}: {:?}", graph.warnings);
+        assert_eq!(graph.links[0].from_port, port);
+    }
+
+    let graph = materialize(&json!({
+        "nodes": [
+            {"id": "optional", "type": "upload", "fields": {"optional": true}},
+            {"id": "sink", "type": "text"},
+        ],
+        "links": [{
+            "from": {"node": "optional", "port": "image"},
+            "to": {"node": "sink", "port": "text"},
+        }],
+    })).unwrap();
+    let result = run(&graph, &Ctx::new("", "")).unwrap_or_else(|e| panic!("{}", e.message));
+    assert_eq!(result.outputs["sink"], "");
+}
+
+#[test]
+fn source_wire_validation_checks_current_canonical_frame_ports() {
+    let mut graph = materialize(&json!({
+        "nodes": [
+            {"id": "frames", "type": "vframes"},
+            {"id": "sink", "type": "resize"},
+        ],
+        "links": [{
+            "from": {"node": "frames", "port": "frame1"},
+            "to": {"node": "sink", "port": "image"},
+        }],
+    })).unwrap();
+    assert!(graph.warnings.is_empty());
+    for port in ["frame0", "frame01", "frame+1", "frame49"] {
+        graph.links[0].from_port = port.into();
+        let failure = run(&graph, &Ctx::new("", "")).unwrap_err();
+        assert!(failure.message.contains(&format!("undeclared source port {port:?}")));
+        assert!(failure.result.is_none());
     }
 }
 

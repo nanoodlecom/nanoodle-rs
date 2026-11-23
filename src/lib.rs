@@ -197,6 +197,24 @@ pub struct Link {
     pub to_port: String,
 }
 
+fn undeclared_source_port(source: &Node, link: &Link) -> Option<String> {
+    let (_, _, ports) = node_type(&source.ty)?;
+    let port = link.from_port.as_str();
+    let possible = ports.contains(&port)
+        || match source.ty.as_str() {
+            "vframes" => local_media::frame_output_index(port).is_some(),
+            // Branch mode is checked separately by BranchPlan.
+            "decide" => matches!(port, "yes" | "no" | "decision"),
+            "image" | "endpoint" => port == "images",
+            "edit" | "inpaint" => matches!(port, "images" | "layers"),
+            _ => false,
+        };
+    (!possible).then(|| format!(
+        "wire {}.{} → {}.{} uses undeclared source port {:?} on {}",
+        link.from_node, port, link.to_node, link.to_port, port, source.display_name()
+    ))
+}
+
 #[derive(Debug)]
 pub struct Graph {
     pub nodes: Vec<Node>,
@@ -315,7 +333,6 @@ pub fn materialize(data: &Value) -> Result<Graph> {
         }
         nodes.push(n);
     }
-    let ids: HashSet<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
     let by_id: HashMap<&str, &Node> = nodes.iter().map(|n| (n.id.as_str(), n)).collect();
     let mut links = Vec::new();
     if let Some(raw_links) = obj.get("links").and_then(|v| v.as_array()) {
@@ -326,15 +343,20 @@ pub fn materialize(data: &Value) -> Result<Graph> {
             };
             let (fn_, fp) = (node_id_str(f.get("node")), port_str(f.get("port")));
             let (tn, mut tp) = (node_id_str(t.get("node")), port_str(t.get("port")));
-            if fn_.is_empty() || !ids.contains(fn_.as_str()) || !ids.contains(tn.as_str()) {
+            if fn_.is_empty() {
                 continue;
             }
-            if let Some(to_node) = by_id.get(tn.as_str()) {
-                if (to_node.ty == "music" || to_node.ty == "tts") && tp == "text" {
-                    tp = "prompt".to_string();
-                }
+            let (Some(source), Some(target)) = (by_id.get(fn_.as_str()), by_id.get(tn.as_str())) else {
+                continue;
+            };
+            if matches!(target.ty.as_str(), "music" | "tts") && tp == "text" {
+                tp = "prompt".to_string();
             }
-            links.push(Link { from_node: fn_, from_port: fp, to_node: tn, to_port: tp });
+            let link = Link { from_node: fn_, from_port: fp, to_node: tn, to_port: tp };
+            if let Some(warning) = undeclared_source_port(source, &link) {
+                warnings.push(warning);
+            }
+            links.push(link);
         }
     }
     Ok(Graph { nodes, links, warnings })
@@ -2017,8 +2039,16 @@ pub fn run(graph: &Graph, ctx: &Ctx) -> std::result::Result<RunResult, RunFailur
         ))
         .into());
     }
-    let order = topo_sort(graph)?; // cycle check (names the cyclic nodes)
     let by_id: HashMap<&str, &Node> = graph.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
+    // Validate the current links, including graphs built or edited through the Rust API.
+    for link in &graph.links {
+        if let Some(message) = by_id.get(link.from_node.as_str())
+            .and_then(|source| undeclared_source_port(source, link))
+        {
+            return Err(NanoodleError(message).into());
+        }
+    }
+    let order = topo_sort(graph)?; // cycle check (names the cyclic nodes)
     let branches = BranchPlan::new(graph, &order, &by_id)?;
     let total = graph.nodes.len();
 
@@ -2063,7 +2093,7 @@ pub fn run(graph: &Graph, ctx: &Ctx) -> std::result::Result<RunResult, RunFailur
         for l in &graph.links {
             let source = l.from_node.as_str();
             if by_id.get(source).is_some_and(|n| n.ty == "vframes") {
-                if let Some(floor) = local_media::wired_frame_floor(&l.from_port) {
+                if let Some(floor) = local_media::frame_output_index(&l.from_port) {
                     let count = frame_floors.entry(source).or_insert(1);
                     *count = (*count).max(floor);
                 }

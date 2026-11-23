@@ -93,6 +93,9 @@ three-way comparison.
 
 Execution semantics worth knowing:
 
+- Loading a workflow warns about wires from undeclared source ports. Fix the
+  reported wire before running. An invalid source port stops the run before any
+  node executes.
 - A node whose upstream errored is itself recorded `error`
   (`upstream failed: <name>`), cascading down the chain; a closed Decide
   gate instead skips its downstream, unbilled.

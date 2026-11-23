@@ -1621,12 +1621,13 @@ fn trim_audio_to_wav(url: &str, start: f64, length: f64, target_rate: u32, whole
 
 // ---------------------------------------------------------------- vframes
 
-pub(crate) fn wired_frame_floor(port: &str) -> Option<i64> {
+pub(crate) fn frame_output_index(port: &str) -> Option<i64> {
     let digits = port.strip_prefix("frame")?;
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+    if digits.starts_with('0') || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    Some(digits.parse::<i64>().unwrap_or(MAX_FRAMES).clamp(1, MAX_FRAMES))
+    let index = digits.parse().ok()?;
+    (1..=MAX_FRAMES).contains(&index).then_some(index)
 }
 
 pub(crate) fn vframes_count(node: &Node) -> i64 {
