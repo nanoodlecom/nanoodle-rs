@@ -29,7 +29,7 @@ fn main() -> ExitCode {
         Ok(v) => v,
         Err(msg) => {
             println!("{}", json!({ "loadError": msg }).to_string());
-            return ExitCode::SUCCESS;
+            return ExitCode::FAILURE;
         }
     };
     let warnings: Vec<Value> = graph.warnings.iter().map(|w| json!(w)).collect();
@@ -90,6 +90,7 @@ fn main() -> ExitCode {
                 })
                 .to_string()
             );
+            ExitCode::SUCCESS
         }
         Err(f) => {
             // A failed run carries its partial result (JS RunError.result):
@@ -123,7 +124,7 @@ fn main() -> ExitCode {
                 })
                 .to_string()
             );
+            ExitCode::FAILURE
         }
     }
-    ExitCode::SUCCESS
 }

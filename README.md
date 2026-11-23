@@ -52,6 +52,7 @@ cargo add nanoodle
 
 The run report includes the outputs, node statuses, cost, and errors.
 If the run fails, it includes the error and any results produced so far.
+Load and run failures exit with status 1 and still write a JSON report to stdout.
 Use `--base-url` for a compatible provider or `--catalog catalog.json` to
 supply a local model catalog.
 
@@ -97,7 +98,11 @@ Execution semantics worth knowing:
   dependents run on their remaining inputs.
 - Video → frames uses `ffmpeg` and `ffprobe` on `PATH` and exposes up to 48
   image ports (`frame1` through `frame48`). A saved wire to a higher frame
-  raises the requested count up to that limit.
+  raises the requested count up to that limit. Set `startSec` or `endSec`
+  for an inclusive range measured from the first video frame. Within the
+  range, `stride` selects every Nth frame in the chosen direction. If you
+  leave stride blank, `gap` is the minimum time between selected frames.
+  The node can return fewer frames than requested when the range runs out.
 - Every model-driven runner requires `fields.model` — there are no silent
   defaults (exceptions: model3d defaults to Tripo, cleanvoice has a
   default model).
