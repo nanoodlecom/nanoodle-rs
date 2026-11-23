@@ -44,7 +44,14 @@ jobs:
       - name: Install the Rust toolchain
         run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
       - name: Test the crate
-        run: cargo +"$RUST_TOOLCHAIN" test --locked
+        run: |
+          if ! NANOODLE_CHROME="$(command -v google-chrome)"; then
+            echo "::error::Google Chrome is required for Render 3D integration tests"
+            exit 1
+          fi
+          export NANOODLE_CHROME
+          "$NANOODLE_CHROME" --version
+          cargo +"$RUST_TOOLCHAIN" test --locked
       - name: Verify the release archive
         run: cargo +"$RUST_TOOLCHAIN" package --locked
       - name: Check for a version bump on main
