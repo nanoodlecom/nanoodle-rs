@@ -1,4 +1,4 @@
-use nanoodle::{materialize, run, Ctx};
+use nanoodle::{materialize, run, topo_sort, Ctx};
 use serde_json::{json, Value};
 use std::{
     io::{self, BufRead, BufReader, Read, Write},
@@ -226,6 +226,69 @@ fn source_wire_validation_checks_current_canonical_frame_ports() {
         let failure = run(&graph, &Ctx::new("", "")).unwrap_err();
         assert!(failure.message.contains(&format!("undeclared source port {port:?}")));
         assert!(failure.result.is_none());
+    }
+}
+
+#[test]
+fn retained_dangling_wire_can_be_inspected_and_repaired() {
+    let mut graph = materialize(&json!({
+        "nodes": [
+            {"id":"source","type":"text","fields":{"text":"repaired"}},
+            {"id":"sink","type":"text","fields":{"text":"fallback"}},
+        ],
+        "links": [{"from":{"node":"source","port":"text"}}],
+    })).unwrap();
+    assert_eq!(graph.links.len(), 1);
+    assert_eq!(graph.links[0].to_node, "");
+    assert!(graph.warnings[0].contains("references missing target node"));
+    assert_eq!(topo_sort(&graph).unwrap(), ["source", "sink"]);
+    assert!(run(&graph, &Ctx::new("", "")).unwrap_err().result.is_none());
+
+    graph.links[0].to_node = "sink".into();
+    graph.links[0].to_port = "text".into();
+    let result = run(&graph, &Ctx::new("", "")).unwrap_or_else(|e| panic!("{}", e.message));
+    assert_eq!(result.outputs["sink"], "repaired");
+}
+
+#[test]
+fn target_wire_validation_uses_the_declared_controls_and_handles() {
+    for (ty, port, valid, effective_port) in [
+        ("audio", "text", true, "prompt"),
+        ("music", "text", true, "prompt"),
+        ("resize", "width", true, "width"),
+        ("llm", "audio", true, "audio"),
+        ("llm", "video", true, "video"),
+        ("llm", "img3", true, "img3"),
+        ("llm", "system", true, "system"),
+        ("llm", "model", true, "model"),
+        ("llm", "text", false, "text"),
+        ("llm", "image3", false, "image3"),
+        ("edit", "image3", true, "image3"),
+        ("decide-branch", "text", true, "text"),
+        ("decide-branch", "branch", false, "branch"),
+        ("combine", "clip2", true, "clip2"),
+        ("combine", "vid3", true, "vid3"),
+        ("tvideo", "ref3", true, "ref3"),
+        ("ivideo", "endframe", true, "endframe"),
+        ("vedit", "image", true, "image"),
+        ("vedit", "ref2", true, "ref2"),
+        ("render3d", "mode", true, "mode"),
+        ("vframes", "stride", true, "stride"),
+        ("endpoint", "mode", true, "mode"),
+        ("endpoint", "url", true, "url"),
+        ("comment", "audio", false, "audio"),
+    ] {
+        let graph = materialize(&json!({
+            "nodes": [
+                {"id":"source","type":"text","fields":{"text":"wired"}},
+                {"id":"sink","type":ty,"fields":{"mode":"chat"}},
+            ],
+            "links": [{
+                "from":{"node":"source","port":"text"}, "to":{"node":"sink","port":port},
+            }],
+        })).unwrap();
+        assert_eq!(graph.links[0].to_port, effective_port);
+        assert_eq!(graph.warnings.is_empty(), valid, "{ty}.{port}: {:?}", graph.warnings);
     }
 }
 

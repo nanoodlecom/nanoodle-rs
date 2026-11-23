@@ -121,25 +121,11 @@ fn dynamic_input_name(port: &str) -> bool {
 
 /// ^img\d*$ | ^image\d*$ | ^vid\d*$ | ^clip\d*$ | ^ref\d*$  (JS DYNAMIC_INPUT_RES).
 fn dynamic_input_re(port: &str) -> bool {
-    fn digits(s: &str) -> bool {
-        !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
-    }
-    if let Some(r) = port.strip_prefix("img") {
-        return r.is_empty() || digits(r);
-    }
-    if let Some(r) = port.strip_prefix("image") {
-        return r.is_empty() || digits(r);
-    }
-    if let Some(r) = port.strip_prefix("vid") {
-        return r.is_empty() || digits(r);
-    }
-    if let Some(r) = port.strip_prefix("clip") {
-        return r.is_empty() || digits(r);
-    }
-    if let Some(r) = port.strip_prefix("ref") {
-        return r.is_empty() || digits(r);
-    }
-    false
+    ["img", "image", "vid", "clip", "ref"].iter().any(|prefix| numbered_input_port(port, prefix))
+}
+
+fn numbered_input_port(port: &str, prefix: &str) -> bool {
+    port.strip_prefix(prefix).is_some_and(|suffix| suffix.bytes().all(|b| b.is_ascii_digit()))
 }
 
 pub fn is_input_port(node: &Node, port: &str) -> bool {
@@ -197,6 +183,12 @@ pub struct Link {
     pub to_port: String,
 }
 
+impl fmt::Display for Link {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "wire {}.{} → {}.{}", self.from_node, self.from_port, self.to_node, self.to_port)
+    }
+}
+
 fn undeclared_source_port(source: &Node, link: &Link) -> Option<String> {
     let (_, _, ports) = node_type(&source.ty)?;
     let port = link.from_port.as_str();
@@ -210,9 +202,86 @@ fn undeclared_source_port(source: &Node, link: &Link) -> Option<String> {
             _ => false,
         };
     (!possible).then(|| format!(
-        "wire {}.{} → {}.{} uses undeclared source port {:?} on {}",
-        link.from_node, port, link.to_node, link.to_port, port, source.display_name()
+        "{link} uses undeclared source port {port:?} on {}", source.display_name()
     ))
+}
+
+/// Additional handles and wired fields beyond a node's static ports and workflow inputs.
+/// An authored setting or model can change at run time, so recognize all supported modes.
+fn extra_wire_targets(ty: &str, port: &str) -> bool {
+    let dynamic = match ty {
+        "llm" | "decide" => numbered_input_port(port, "img"),
+        "edit" => numbered_input_port(port, "image"),
+        "tvideo" | "ivideo" | "vedit" => numbered_input_port(port, "ref"),
+        "combine" => numbered_input_port(port, "clip") || numbered_input_port(port, "vid"),
+        _ => false,
+    };
+    if dynamic {
+        return true;
+    }
+    let fields: &[&str] = match ty {
+        "choice" => &["selected", "options"],
+        "join" => &["sep"],
+        "llm" => &["audio", "video", "model", "temperature", "maxTokens", "format", "reasoningEffort", "showThinking"],
+        "vision" => &["model", "q"],
+        "decide" => &["model", "mode", "question", "options", "levels", "gate"],
+        "image" | "edit" | "inpaint" => {
+            if ty == "image" && matches!(port, "variations" | "sel" | "customCivitaiAir") {
+                return true;
+            }
+            &["prompt", "model", "size", "seed", "modelOpts", "loras", "loraUrl", "loraStrength"]
+        }
+        "tvideo" | "ivideo" | "vedit" => {
+            if (ty == "ivideo" && port == "endframe") || (ty == "vedit" && port == "image") {
+                return true;
+            }
+            &["prompt", "model", "resolution", "aspect", "duration", "modelOpts", "loras", "loraUrl", "loraStrength"]
+        }
+        "model3d" => &["modelOpts"],
+        "lipsync" => &["prompt", "model", "resolution", "aspect", "duration", "modelOpts"],
+        "music" => &["model", "lyrics", "instrumental", "duration", "negative_prompt", "seed", "response_format", "extraJson"],
+        "remix" => &["model", "lyrics", "duration", "response_format", "extraJson"],
+        "tts" => &["model", "voice", "speed", "instructions", "response_format", "extraJson"],
+        "transcribe" => &["model", "language"],
+        "cleanvoice" => &["model", "url"],
+        "endpoint" => &["url", "mode", "model", "auth", "system", "size"],
+        "slice-3d" => &["preset", "clip", "frames", "slices", "resolution", "palette", "outline", "upAxis"],
+        "sprite-stack-render" => &["yaw", "pitch", "spacing", "scale", "turntable", "duration", "fps", "yawStart", "yawEnd"],
+        "resize" => &["mode", "width", "height"],
+        "vframes" => &["dir", "frames", "gap", "stride", "startSec", "endSec"],
+        "render3d" => &[
+            "mode", "azimuth", "elevation", "distance", "width", "height", "background", "clipAxis", "clipPos",
+            "clipSweep", "explode", "isolate", "animClip", "animTime", "turntable", "duration", "fps",
+        ],
+        "combine" => &["dedup"],
+        "soundtrack" => &["loop"],
+        "trim" | "extractaudio" => &["start", "length"],
+        _ => &[],
+    };
+    fields.contains(&port)
+}
+
+fn undeclared_target_port(target: &Node, link: &Link) -> Option<String> {
+    let (_, inputs, _) = node_type(&target.ty)?;
+    let port = link.to_port.as_str();
+    let possible = inputs.contains(&port)
+        || input_specs(&target.ty).iter().any(|(field, ..)| *field == port)
+        || extra_wire_targets(&target.ty, port);
+    (!possible).then(|| format!(
+        "{link} uses undeclared target port {port:?} on {}", target.display_name()
+    ))
+}
+
+fn wire_issue(by_id: &HashMap<&str, &Node>, link: &Link) -> Option<String> {
+    let source_id = link.from_node.as_str();
+    let target_id = link.to_node.as_str();
+    let Some(source) = by_id.get(source_id).filter(|_| !source_id.is_empty()) else {
+        return Some(format!("{link} references missing source node {source_id:?}"));
+    };
+    let Some(target) = by_id.get(target_id).filter(|_| !target_id.is_empty()) else {
+        return Some(format!("{link} references missing target node {target_id:?}"));
+    };
+    undeclared_source_port(source, link).or_else(|| undeclared_target_port(target, link))
 }
 
 #[derive(Debug)]
@@ -337,23 +406,15 @@ pub fn materialize(data: &Value) -> Result<Graph> {
     let mut links = Vec::new();
     if let Some(raw_links) = obj.get("links").and_then(|v| v.as_array()) {
         for l in raw_links {
-            let (f, t) = match (l.get("from"), l.get("to")) {
-                (Some(f), Some(t)) => (f, t),
-                _ => continue,
-            };
+            let f = l.get("from").unwrap_or(&Value::Null);
+            let t = l.get("to").unwrap_or(&Value::Null);
             let (fn_, fp) = (node_id_str(f.get("node")), port_str(f.get("port")));
             let (tn, mut tp) = (node_id_str(t.get("node")), port_str(t.get("port")));
-            if fn_.is_empty() {
-                continue;
-            }
-            let (Some(source), Some(target)) = (by_id.get(fn_.as_str()), by_id.get(tn.as_str())) else {
-                continue;
-            };
-            if matches!(target.ty.as_str(), "music" | "tts") && tp == "text" {
+            if tp == "text" && by_id.get(tn.as_str()).is_some_and(|target| matches!(target.ty.as_str(), "music" | "tts")) {
                 tp = "prompt".to_string();
             }
             let link = Link { from_node: fn_, from_port: fp, to_node: tn, to_port: tp };
-            if let Some(warning) = undeclared_source_port(source, &link) {
+            if let Some(warning) = wire_issue(&by_id, &link) {
                 warnings.push(warning);
             }
             links.push(link);
@@ -383,11 +444,14 @@ pub fn topo_sort(graph: &Graph) -> Result<Vec<String>> {
     let mut indeg: HashMap<&str, usize> = graph.nodes.iter().map(|n| (n.id.as_str(), 0)).collect();
     let mut out_adj: HashMap<&str, Vec<&str>> = graph.nodes.iter().map(|n| (n.id.as_str(), Vec::new())).collect();
     for l in &graph.links {
-        if let Some(v) = out_adj.get_mut(l.from_node.as_str()) {
-            v.push(l.to_node.as_str());
-        }
-        if let Some(d) = indeg.get_mut(l.to_node.as_str()) {
-            *d += 1;
+        // Inspection can sort the known nodes. Execution separately rejects dangling wires.
+        let from = l.from_node.as_str();
+        let to = l.to_node.as_str();
+        if !from.is_empty() && !to.is_empty() {
+            if let (Some(targets), Some(degree)) = (out_adj.get_mut(from), indeg.get_mut(to)) {
+                targets.push(to);
+                *degree += 1;
+            }
         }
     }
     let mut order = Vec::new();
@@ -2042,11 +2106,19 @@ pub fn run(graph: &Graph, ctx: &Ctx) -> std::result::Result<RunResult, RunFailur
     let by_id: HashMap<&str, &Node> = graph.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
     // Validate the current links, including graphs built or edited through the Rust API.
     for link in &graph.links {
-        if let Some(message) = by_id.get(link.from_node.as_str())
-            .and_then(|source| undeclared_source_port(source, link))
-        {
+        if let Some(message) = wire_issue(&by_id, link) {
             return Err(NanoodleError(message).into());
         }
+    }
+    // These LLM media handles are valid in the editor, but the Rust LLM runner
+    // has no audio or video payload support. A text-only request would lose the wire.
+    if let Some(link) = graph.links.iter().find(|link| {
+        matches!(link.to_port.as_str(), "audio" | "video")
+            && by_id.get(link.to_node.as_str()).is_some_and(|node| node.ty == "llm")
+    }) {
+        return Err(NanoodleError(format!(
+            "{link} uses unsupported LLM input {:?} in the Rust executor", link.to_port
+        )).into());
     }
     let order = topo_sort(graph)?; // cycle check (names the cyclic nodes)
     let branches = BranchPlan::new(graph, &order, &by_id)?;
