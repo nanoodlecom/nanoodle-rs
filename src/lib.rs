@@ -372,33 +372,34 @@ pub fn materialize(data: &Value) -> Result<Graph> {
     let mut warnings = Vec::new();
     let mut nodes: Vec<Node> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
-    for raw in raw_nodes {
-        let (id, ty) = match (raw.get("id"), raw.get("type")) {
-            (Some(i), Some(t)) if !i.is_null() => {
-                let id = match i {
-                    Value::String(s) => s.clone(),
-                    other => other.to_string(),
-                };
-                let ty = t.as_str().unwrap_or("").to_string();
-                if ty.is_empty() {
-                    continue;
-                }
-                (id, ty)
-            }
-            _ => continue,
+    for (index, raw) in raw_nodes.iter().enumerate() {
+        let position = index + 1;
+        let raw = raw.as_object().ok_or_else(|| {
+            NanoodleError(format!("node at position {position} must be an object"))
+        })?;
+        let id = match raw.get("id") {
+            Some(Value::String(id)) if !id.trim().is_empty() => id.clone(),
+            Some(Value::Number(id)) if id.as_f64().is_some_and(f64::is_finite) => id.to_string(),
+            _ => return Err(NanoodleError(format!(
+                "node at position {position} has a missing or invalid id (expected a non-empty string or finite number)"
+            ))),
         };
+        let raw_type = raw.get("type").and_then(Value::as_str)
+            .filter(|ty| !ty.trim().is_empty()).ok_or_else(|| NanoodleError(format!(
+                "node at position {position} has a missing or invalid type (expected a non-empty string)"
+            )))?;
         if !seen.insert(id.clone()) {
             return Err(NanoodleError(format!(
                 "duplicate node id \"{}\" — every node must have a unique id",
                 id
             )));
         }
-        let branching = ty == "decide-branch";
-        let ty = match ty.as_str() {
-            "audio" => "tts".into(),
-            "decide-branch" => "decide".into(),
-            _ => ty,
-        };
+        let branching = raw_type == "decide-branch";
+        let ty = match raw_type {
+            "audio" => "tts",
+            "decide-branch" => "decide",
+            _ => raw_type,
+        }.to_owned();
         let mut n = Node {
             id,
             name: raw.get("name").and_then(|v| v.as_str()).map(|s| s.to_string()),
@@ -413,7 +414,7 @@ pub fn materialize(data: &Value) -> Result<Graph> {
             n.unknown = true;
             warnings.push(format!(
                 "unknown node type \"{}\" (node {}) — kept, but running this workflow will fail; you may need a newer nanoodle library",
-                raw.get("type").and_then(|v| v.as_str()).unwrap_or(""),
+                raw_type,
                 n.id
             ));
         } else {
