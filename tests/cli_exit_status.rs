@@ -107,10 +107,11 @@ fn with_chat_provider(check: impl FnOnce(&str)) -> Option<String> {
                 }
                 headers.push_str(&line);
             }
-            io::copy(&mut reader.take(content_length), &mut io::sink()).unwrap();
+            let mut request_body = String::new();
+            reader.take(content_length).read_to_string(&mut request_body).unwrap();
             let body = r#"{"choices":[{"message":{"content":"provider output"}}]}"#;
             write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
-            Some(headers)
+            Some(format!("{headers}\r\n{request_body}"))
         });
         check(&base_url);
         drop(keep_serving);
@@ -175,6 +176,96 @@ fn run_accepts_the_documented_provider_options() {
     assert!(request
         .to_ascii_lowercase()
         .contains("\r\nauthorization: bearer fixture\r\n"));
+}
+
+#[test]
+fn malformed_wires_are_reported_before_a_provider_can_use_the_fallback() {
+    let mut data = json!({
+        "nodes": [
+            {"id":"source","type":"text","fields":{"text":"wired prompt"}},
+            {"id":"chat","type":"llm","fields":{
+                "model":"fixture", "prompt":"stored fallback", "promtp":"also not a supported field"
+            }},
+        ],
+        "links": [],
+    });
+    for (name, source, target, port, diagnostic) in [
+        ("missing-source", "absent", "chat", "prompt",
+            "wire absent.text → chat.prompt references missing source node \"absent\""),
+        ("missing-target", "source", "absent", "prompt",
+            "wire source.text → absent.prompt references missing target node \"absent\""),
+        ("target-typo", "source", "chat", "promtp",
+            "wire source.text → chat.promtp uses undeclared target port \"promtp\" on LLM"),
+    ] {
+        data["links"] = json!([{
+            "from": {"node":source,"port":"text"}, "to": {"node":target,"port":port},
+        }]);
+        let file = GraphFile::new(name, &data.to_string());
+        let (status, report) = file.invoke("load");
+        assert_eq!(status, 0);
+        assert_eq!(report["loadWarnings"], json!([diagnostic]));
+
+        let request = with_chat_provider(|base_url| {
+            let output = file.command("run").args(["--base-url", base_url, "--api-key", "fixture"])
+                .output().unwrap();
+            let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(output.status.code(), Some(1), "{report}");
+            assert_eq!(report["runError"], diagnostic);
+            assert_eq!(report["nodes"], json!({}));
+            assert_eq!(report["cost"], Value::Null);
+        });
+        assert!(request.is_none(), "unexpected provider request: {request:?}");
+    }
+
+    data["links"] = json!([{
+        "from": {"node":"source","port":"text"}, "to": {"node":"chat","port":"prompt"},
+    }]);
+    let file = GraphFile::new("valid-prompt-wire", &data.to_string());
+    let request = with_chat_provider(|base_url| {
+        let output = file.command("run").args(["--base-url", base_url, "--api-key", "fixture"])
+            .output().unwrap();
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(output.status.success(), "{report}");
+        assert_eq!(report["outputs"]["chat"], "provider output");
+    }).expect("the valid graph should request the provider");
+    let (_, body) = request.split_once("\r\n\r\n").unwrap();
+    let body: Value = serde_json::from_str(body).unwrap();
+    assert_eq!(body["messages"][1]["content"], "wired prompt");
+}
+
+#[test]
+fn unsupported_llm_media_wires_are_inspectable_and_stop_before_a_provider_call() {
+    for (source_type, port, media) in [
+        ("aupload", "audio", "data:audio/wav;base64,AAAA"),
+        ("vupload", "video", "data:video/mp4;base64,AAAA"),
+    ] {
+        let data = json!({
+            "nodes": [
+                {"id":"source","type":source_type,"fields":{(port):media}},
+                {"id":"chat","type":"llm","fields":{"model":"fixture","prompt":"authored prompt"}},
+            ],
+            "links": [{
+                "from":{"node":"source","port":port}, "to":{"node":"chat","port":port},
+            }],
+        });
+        let file = GraphFile::new(port, &data.to_string());
+        let (status, report) = file.invoke("load");
+        assert_eq!(status, 0);
+        assert_eq!(report["loadWarnings"], json!([]));
+
+        let request = with_chat_provider(|base_url| {
+            let output = file.command("run").args(["--base-url", base_url, "--api-key", "fixture"])
+                .output().unwrap();
+            let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(output.status.code(), Some(1), "{report}");
+            assert_eq!(report["runError"], format!(
+                "wire source.{port} → chat.{port} uses unsupported LLM input {port:?} in the Rust executor"
+            ));
+            assert_eq!(report["nodes"], json!({}));
+            assert_eq!(report["cost"], Value::Null);
+        });
+        assert!(request.is_none(), "unexpected provider request: {request:?}");
+    }
 }
 
 impl Drop for GraphFile {
