@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 pub mod audio;
 pub mod endpoint;
 pub mod local_media;
+pub mod render3d;
 pub mod video;
 
 // ---------------------------------------------------------------- errors
@@ -84,6 +85,7 @@ fn node_type(ty: &str) -> Option<(&'static str, &'static [&'static str], &'stati
         "model3d" => ("3D model", &["image", "model"][..], &["model"][..]),
         "vedit" => ("Video edit", &["video"][..], &["video"][..]),
         "vframes" => ("Video → frames", &["video"][..], &["frame1"][..]),
+        "render3d" => ("Render 3D", &["model"][..], &["image", "video"][..]),
         "combine" => ("Combine videos", &[][..], &["video"][..]),
         "soundtrack" => ("Soundtrack", &["video", "audio"][..], &["video"][..]),
         "lipsync" => ("Avatar / lipsync", &["image", "audio"][..], &["video"][..]),
@@ -103,7 +105,7 @@ fn node_type(ty: &str) -> Option<(&'static str, &'static [&'static str], &'stati
 pub const NODE_TYPE_NAMES: &[&str] = &[
     "text", "upload", "aupload", "vupload", "mupload", "choice", "join", "llm",
     "image", "edit", "inpaint", "resize", "slice-3d", "sprite-stack-render", "vision", "decide", "tvideo", "ivideo",
-    "model3d", "vedit", "vframes", "combine", "soundtrack", "lipsync", "music",
+    "model3d", "vedit", "vframes", "render3d", "combine", "soundtrack", "lipsync", "music",
     "remix", "tts", "trim", "extractaudio", "transcribe", "cleanvoice",
     "endpoint", "comment",
 ];
@@ -674,6 +676,7 @@ fn run_node(
         "slice-3d" | "sprite-stack-render" => local_media::run_sprite(node, inputs).map_err(Into::into),
         "resize" => local_media::run_resize(node, inputs, ctx).map_err(Into::into),
         "vframes" => local_media::run_vframes(node, inputs, ctx).map_err(Into::into),
+        "render3d" => render3d::run_render3d(node, inputs, ctx).map_err(Into::into),
         "combine" => local_media::run_combine(node, inputs, ctx).map_err(Into::into),
         "soundtrack" => local_media::run_soundtrack(node, inputs, ctx).map_err(Into::into),
         "trim" => local_media::run_trim(node, inputs, ctx).map_err(Into::into),
@@ -2133,9 +2136,9 @@ pub fn run(graph: &Graph, ctx: &Ctx) -> std::result::Result<RunResult, RunFailur
             _ => continue,
         };
         let (_, _, ports) = node_type(&n.ty).unwrap_or(("", &[], &[]));
-        let value = if n.ty == "endpoint" {
-            // The endpoint runner emits the port for the resolved mode, which
-            // can come from a wire or route prefix as well as from a field.
+        let value = if matches!(n.ty.as_str(), "endpoint" | "render3d") {
+            // These runners emit the port for the resolved mode. The endpoint's
+            // mode can also come from a wire or route prefix.
             ports.iter().find_map(|port| rec.out.get(*port))
         } else {
             rec.out.get(ports[0])

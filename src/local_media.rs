@@ -294,10 +294,10 @@ pub use sprite_stack::run_sprite;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-struct TempDir(PathBuf);
+pub(crate) struct TempDir(PathBuf);
 
 impl TempDir {
-    fn new() -> Result<TempDir> {
+    pub(crate) fn new() -> Result<TempDir> {
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
         for _ in 0..100 {
             let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -315,7 +315,7 @@ impl TempDir {
         }
         Err(err("couldn't create temp dir"))
     }
-    fn path(&self, name: &str) -> PathBuf {
+    pub(crate) fn path(&self, name: &str) -> PathBuf {
         self.0.join(name)
     }
 }
@@ -969,14 +969,14 @@ fn crc32(data: &[u8]) -> u32 {
 // ---------------------------------------------------------------- PNG codec
 
 #[derive(Clone)]
-struct PngImage {
+pub(crate) struct PngImage {
     width: u32,
     height: u32,
-    rgba: Vec<u8>, // RGBA, width*height*4
+    pub(crate) rgba: Vec<u8>, // RGBA, width*height*4
 }
 
 /// Local media operations retain their existing per-side image limit.
-fn decode_png(bytes: &[u8]) -> Result<PngImage> {
+pub(crate) fn decode_png(bytes: &[u8]) -> Result<PngImage> {
     sprite_codecs::read_png(bytes, false)
 }
 
