@@ -4,11 +4,9 @@
 //! ONE scene implementation (render3d-assets/scene.html, three.js) renders
 //! a GLB with the node's fields: camera azimuth/elevation/distance, a
 //! clip plane (slice-3D), explode over the GLB's scene-graph parts, part
-//! isolation, animation stepping, turntable. The JS executor drives the
-//! scene over CDP; this twin reads a completed canvas frame from Chromium
-//! using the scene's auto mode (fields in the URL
-//! fragment) — no new dependencies (the crate carries serde_json + ureq
-//! only). Chromium discovery mirrors the ffmpeg contract: NANOODLE_CHROME
+//! isolation, animation stepping, turntable. Like the JS executor, this
+//! drives a single Chromium scene over CDP for all frames. Chromium
+//! discovery mirrors the ffmpeg contract: NANOODLE_CHROME
 //! / CHROME_PATH, the Playwright browser cache, then PATH. Video mode
 //! assembles frames with ffmpeg, same as the other local nodes.
 
@@ -25,6 +23,9 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+mod cdp;
+use cdp::Chromium;
+
 const SCENE_HTML: &str = include_str!("render3d-assets/scene.html");
 const THREE_JS: &[u8] = include_bytes!("render3d-assets/three.module.js");
 const GLTF_LOADER: &[u8] = include_bytes!("render3d-assets/addons/loaders/GLTFLoader.js");
@@ -32,6 +33,7 @@ const ROOM_ENV: &[u8] = include_bytes!("render3d-assets/addons/environments/Room
 const BG_UTILS: &[u8] = include_bytes!("render3d-assets/addons/utils/BufferGeometryUtils.js");
 const MAX_MODEL_BYTES: usize = 64 * 1024 * 1024;
 const RENDER_TIMEOUT: Duration = Duration::from_secs(120);
+const TIMEOUT_MESSAGE: &str = "render3d exceeded the two-minute limit";
 
 fn err(msg: impl Into<String>) -> NanoodleError {
     NanoodleError(msg.into())
@@ -182,20 +184,9 @@ fn serve_scene(glb: Vec<u8>, stop: Arc<AtomicBool>) -> Result<(u16, JoinHandle<(
     Ok((port, worker))
 }
 
-fn percent_encode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() * 2);
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
-}
-
 fn run_with_timeout(mut cmd: Command, deadline: Instant, program: &str) -> Result<std::process::ExitStatus> {
     if Instant::now() >= deadline {
-        return Err(err("render3d exceeded the two-minute limit"));
+        return Err(err(TIMEOUT_MESSAGE));
     }
     let mut child = cmd.stderr(Stdio::null()).spawn()
         .map_err(|e| err(format!("render3d: could not launch {program}: {e}")))?;
@@ -206,7 +197,7 @@ fn run_with_timeout(mut cmd: Command, deadline: Instant, program: &str) -> Resul
                 if Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return Err(err("render3d exceeded the two-minute limit"));
+                    return Err(err(TIMEOUT_MESSAGE));
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
@@ -219,29 +210,10 @@ fn run_with_timeout(mut cmd: Command, deadline: Instant, program: &str) -> Resul
     }
 }
 
-fn canvas_png(exe: &PathBuf, port: u16, fields: &Value, dom: &PathBuf, deadline: Instant) -> Result<Vec<u8>> {
-    let frag = percent_encode(&fields.to_string());
-    let url = format!("http://127.0.0.1:{port}/scene.html#f={frag}");
-    let mut cmd = Command::new(exe);
-    cmd.args([
-        "--headless", "--no-sandbox", "--incognito", "--no-first-run", "--no-proxy-server", "--disable-background-networking",
-        "--use-angle=swiftshader", "--enable-unsafe-swiftshader", "--virtual-time-budget=20000", "--dump-dom",
-    ]);
-    let profile = dom.with_file_name("chrome-profile");
-    let mut profile_arg = std::ffi::OsString::from("--user-data-dir=");
-    profile_arg.push(profile);
-    cmd.arg(profile_arg).arg(url);
-    cmd.stdout(std::fs::File::create(dom).map_err(|e| err(format!("render3d: {e}")))?);
-    let status = run_with_timeout(cmd, deadline, "Chromium")?;
-    if !status.success() {
-        return Err(err("render3d: Chromium exited before producing a frame"));
-    }
-    let mut html = String::new();
-    std::fs::File::open(dom).and_then(|f| f.take(32 * 1024 * 1024).read_to_string(&mut html))
-        .map_err(|e| err(format!("render3d: {e}")))?;
-    let (_, payload) = html.split_once("<meta name=\"render3d-png\" content=\"data:image/png;base64,")
-        .ok_or_else(|| err("render3d: scene did not produce a frame; the model must be renderable and self-contained"))?;
-    let (base64, _) = payload.split_once('"').ok_or_else(|| err("render3d: incomplete rendered frame"))?;
+fn canvas_png(browser: &mut Chromium, fields: &Value) -> Result<Vec<u8>> {
+    let data = browser.frame(fields)?;
+    let base64 = data.strip_prefix("data:image/png;base64,")
+        .ok_or_else(|| err("render3d: scene did not produce a PNG frame"))?;
     let png = decode_b64(base64)?;
     let width = fields["width"].as_u64().unwrap_or_default() as u32;
     let height = fields["height"].as_u64().unwrap_or_default() as u32;
@@ -345,9 +317,9 @@ pub fn run_render3d(node: &Node, inputs: &HashMap<String, Value>, _ctx: &Ctx) ->
 
 fn render_with(node: &Node, exe: &PathBuf, port: u16, base: &Value, video: Option<(u32, f64, u64)>, deadline: Instant) -> Result<(&'static str, String)> {
     let dir = TempDir::new()?;
-    let dom = dir.path("render.html");
+    let mut browser = Chromium::open(exe, &dir.path("chrome-profile"), port, deadline)?;
     let Some((fps, duration, frames)) = video else {
-        let png = canvas_png(exe, port, base, &dom, deadline)?;
+        let png = canvas_png(&mut browser, base)?;
         return Ok(("image", format!("data:image/png;base64,{}", b64_encode(&png))));
     };
     // Video: sweep turntable / clip timeline / slice plane across frames.
@@ -372,10 +344,11 @@ fn render_with(node: &Node, exe: &PathBuf, port: u16, base: &Value, video: Optio
         if has_clip_sweep {
             obj.insert("clipPos".into(), json!(1.05 - 2.1 * t));
         }
-        let png = canvas_png(exe, port, &f, &dom, deadline)?;
+        let png = canvas_png(&mut browser, &f)?;
         std::fs::write(dir.path(&format!("frame-{i:03}.png")), png)
             .map_err(|e| err(format!("render3d: {e}")))?;
     }
+    drop(browser);
     let out_mp4 = dir.path("out.mp4");
     let mut cmd = Command::new("ffmpeg");
     cmd.args(["-y", "-loglevel", "error", "-framerate", &fps.to_string(), "-i"])
@@ -534,7 +507,7 @@ mod tests {
         out
     }
 
-    fn render(fields: Map<String, Value>) -> Option<Vec<u8>> {
+    fn render(fields: Map<String, Value>, port: &str) -> Option<Vec<u8>> {
         if find_chromium().is_none() {
             return None; // skip: no chromium discoverable
         }
@@ -545,7 +518,7 @@ mod tests {
         let ctx = Ctx::new("https://nano-gpt.com/api", "fixture");
         match run_render3d(&node, &inputs, &ctx).expect("render3d run") {
             NodeOutcome::Done(m, _) => {
-                let url = m.get("image").and_then(|v| v.as_str()).expect("image port").to_string();
+                let url = m.get(port).and_then(|v| v.as_str()).expect("render output port");
                 Some(decode_b64(url.split_once(',').unwrap().1).unwrap())
             }
             _ => panic!("unexpected gated outcome"),
@@ -579,7 +552,7 @@ mod tests {
         fields.insert("height".into(), json!("240"));
         fields.insert("azimuth".into(), json!("0"));
         fields.insert("elevation".into(), json!("0"));
-        let Some(png) = render(fields.clone()) else { return };
+        let Some(png) = render(fields.clone(), "image") else { return };
         assert_eq!(png_dims(&png), (320, 240));
         let (red, blue) = color_counts(&png);
         assert!(red > 500, "red cube visible: {red}");
@@ -588,8 +561,33 @@ mod tests {
         let mut clip_fields = fields;
         clip_fields.insert("clipAxis".into(), json!("x"));
         clip_fields.insert("clipPos".into(), json!("0"));
-        let clipped = render(clip_fields).expect("chromium present");
+        let clipped = render(clip_fields, "image").expect("chromium present");
         let (cr, cb) = color_counts(&clipped);
         assert!(cr + cb < (red + blue) * 3 / 4, "clip cuts: {} vs {}", cr + cb, red + blue);
+    }
+
+    #[test]
+    fn render3d_video_contains_successive_turntable_frames() {
+        let Ok(encoders) = Command::new("ffmpeg").args(["-hide_banner", "-encoders"]).output() else {
+            return;
+        };
+        if !String::from_utf8_lossy(&encoders.stdout).split_whitespace().any(|s| s == "libx264") {
+            return;
+        }
+        let fields = json!({"mode": "video", "width": 96, "height": 64,
+            "fps": 12, "duration": 1, "turntable": 180});
+        let Some(mp4) = render(fields.as_object().unwrap().clone(), "video") else { return };
+        assert_eq!(&mp4[4..8], b"ftyp");
+        let dir = TempDir::new().unwrap();
+        let clip = dir.path("turntable.mp4");
+        std::fs::write(&clip, mp4).unwrap();
+        let result = Command::new("ffmpeg").args(["-loglevel", "error", "-i"])
+            .arg(clip).args(["-f", "framehash", "-"]).output().unwrap();
+        assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+        let output = String::from_utf8(result.stdout).unwrap();
+        let hashes: Vec<_> = output.lines().filter(|line| !line.starts_with('#'))
+            .filter_map(|line| line.rsplit_once(',').map(|(_, hash)| hash.trim())).collect();
+        assert_eq!(hashes.len(), 12);
+        assert_ne!(hashes.first(), hashes.last(), "turntable frames should change");
     }
 }
