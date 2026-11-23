@@ -292,6 +292,56 @@ fn target_wire_validation_uses_the_declared_controls_and_handles() {
     }
 }
 
+#[test]
+fn legacy_input_aliases_share_one_destination() {
+    let graph = materialize(&json!({
+        "nodes": [
+            {"id":"first","type":"text","fields":{"text":"first prompt"}},
+            {"id":"second","type":"text","fields":{"text":"second prompt"}},
+            {"id":"speech","type":"audio","fields":{"model":"fixture"}},
+        ],
+        "links": [
+            {"from":{"node":"first","port":"text"},"to":{"node":"speech","port":"text"}},
+            {"from":{"node":"second","port":"text"},"to":{"node":"speech","port":"prompt"}},
+        ],
+    })).unwrap();
+    let diagnostic = "input speech.prompt has competing wires from first.text, second.text. Leave one active wire for this input.";
+    assert_eq!(graph.warnings, [diagnostic]);
+    let failure = run(&graph, &Ctx::new("", "")).unwrap_err();
+    assert_eq!(failure.message, diagnostic);
+    assert!(failure.result.is_none());
+}
+
+#[test]
+fn a_missing_or_error_skipped_output_does_not_replace_a_live_wire() {
+    assert!(mock_endpoint(
+        "application/json",
+        r#"{"choices":[{"message":{"content":"text output"}}]}"#,
+        |base| {
+            let graph = materialize(&json!({
+                "nodes": [
+                    {"id":"source","type":"text","fields":{"text":"live input"}},
+                    {"id":"skipped","type":"resize","fields":{"onError":"skip"}},
+                    {"id":"endpoint","type":"endpoint","fields":{
+                        "url":format!("{base}/generate"),"mode":"chat","prompt":"generate text"
+                    }},
+                    {"id":"sink","type":"text"},
+                ],
+                "links": [
+                    {"from":{"node":"source","port":"text"},"to":{"node":"sink","port":"text"}},
+                    {"from":{"node":"endpoint","port":"image"},"to":{"node":"sink","port":"text"}},
+                    {"from":{"node":"skipped","port":"image"},"to":{"node":"sink","port":"text"}},
+                ],
+            })).unwrap();
+            assert!(graph.warnings.is_empty());
+            let result = run(&graph, &Ctx::new("", "")).unwrap_or_else(|e| panic!("{}", e.message));
+            assert_eq!(result.outputs["sink"], "live input");
+            assert_eq!(result.nodes["skipped"].status, "skipped");
+            assert!(result.nodes["skipped"].error.is_some());
+        },
+    ));
+}
+
 fn skipped_image(id: &str) -> Value {
     json!({"id": id, "type": "image", "name": "Output", "fields": {
         "prompt": "draw a box", "onError": "skip"

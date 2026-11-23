@@ -1,4 +1,4 @@
-use nanoodle::{materialize, run, Ctx};
+use nanoodle::{materialize, run, Ctx, Graph};
 use serde_json::{json, Value};
 use std::{
     collections::{HashMap, VecDeque},
@@ -81,11 +81,7 @@ impl Drop for StopServer {
     }
 }
 
-#[test]
-fn shared_branch_fixture_and_legacy_round_trip() {
-    let fixture: Value =
-        serde_json::from_str(include_str!("fixtures/decider-branches.json")).unwrap();
-    let graph = materialize(&fixture).unwrap();
+fn with_decision_provider(graph: &Graph, check: impl FnOnce(&Ctx, &Mutex<Script>)) {
     let models = graph
         .nodes
         .iter()
@@ -115,7 +111,16 @@ fn shared_branch_fixture_and_legacy_round_trip() {
                 Err(err) => panic!("{err}"),
             }
         });
+        check(&ctx, &script);
+    });
+}
 
+#[test]
+fn shared_branch_fixture_and_legacy_round_trip() {
+    let fixture: Value =
+        serde_json::from_str(include_str!("fixtures/decider-branches.json")).unwrap();
+    let graph = materialize(&fixture).unwrap();
+    with_decision_provider(&graph, |ctx, script| {
         for scenario in fixture["cases"].as_array().unwrap() {
             let name = scenario["name"].as_str().unwrap();
             {
@@ -128,7 +133,7 @@ fn shared_branch_fixture_and_legacy_round_trip() {
                     .cloned()
                     .collect();
             }
-            let result = match run(&graph, &ctx) {
+            let result = match run(&graph, ctx) {
                 Ok(result) => {
                     assert_ne!(scenario["error"], true, "{name}");
                     assert_eq!(result.outputs["Answer"], scenario["output"], "{name}");
@@ -181,7 +186,7 @@ fn shared_branch_fixture_and_legacy_round_trip() {
                 "id": "failed", "type": "image",
                 "fields": {"prompt": "draw a box", "onError": "skip"}
             }));
-            let result = run(&materialize(&graph).unwrap(), &ctx)
+            let result = run(&materialize(&graph).unwrap(), ctx)
                 .unwrap_or_else(|e| panic!("{}", e.message));
             assert_eq!(result.nodes["n2"].status, if branching { "done" } else { "gated" });
             assert_eq!(result.nodes["n4"].status, "skipped");
@@ -193,4 +198,85 @@ fn shared_branch_fixture_and_legacy_round_trip() {
             assert_eq!(script.lock().unwrap().calls, ["n2"]);
         }
     });
+}
+
+fn wire(from: &str, from_port: &str, to: &str, to_port: &str) -> Value {
+    json!({"from":{"node":from,"port":from_port},"to":{"node":to,"port":to_port}})
+}
+
+#[test]
+fn mutually_exclusive_upstream_routes_can_share_a_destination() {
+    let graph = materialize(&json!({
+        "nodes": [
+            {"id":"n2","type":"decide-branch","fields":{"model":"fixture","question":"Is this yes?"}},
+            {"id":"left","type":"text"},
+            {"id":"right","type":"text"},
+            {"id":"n4","type":"llm","fields":{"model":"consumer"}},
+        ],
+        "links": [
+            wire("n2", "yes", "left", "text"),
+            wire("n2", "no", "right", "text"),
+            wire("left", "text", "n4", "prompt"),
+            wire("right", "text", "n4", "prompt"),
+        ],
+    })).unwrap();
+    assert!(graph.warnings.is_empty());
+    with_decision_provider(&graph, |ctx, script| {
+        for (answer, active, inactive) in [(1, "left", "right"), (0, "right", "left")] {
+            {
+                let mut script = script.lock().unwrap();
+                script.calls.clear();
+                script.answers = [json!(answer)].into();
+            }
+            let result = run(&graph, ctx).unwrap_or_else(|e| panic!("{}", e.message));
+            assert_eq!(result.nodes[active].status, "done");
+            assert_eq!(result.nodes[inactive].status, "skipped");
+            assert_eq!(result.nodes["n4"].status, "done");
+            assert_eq!(script.lock().unwrap().calls, ["n2", "n4"]);
+        }
+    });
+}
+
+#[test]
+fn branch_or_legacy_gate_checks_live_conflicts_before_calling_the_consumer() {
+    for (gate_ty, port) in [("decide-branch", "yes"), ("decide", "text")] {
+        let graph = materialize(&json!({
+            "nodes": [
+                {"id":"n2","type":gate_ty,"fields":{
+                    "model":"fixture","question":"Is this yes?","mode":"yesno","gate":true
+                }},
+                {"id":"left","type":"text","fields":{"text":"first"}},
+                {"id":"right","type":"text","fields":{"text":"second"}},
+                {"id":"n4","type":"llm","fields":{"model":"consumer"}},
+            ],
+            "links": [
+                wire("n2", port, "n4", "system"),
+                wire("left", "text", "n4", "prompt"),
+                wire("right", "text", "n4", "prompt"),
+            ],
+        })).unwrap();
+        assert!(graph.warnings.is_empty(), "{gate_ty}: {:?}", graph.warnings);
+        with_decision_provider(&graph, |ctx, script| {
+            for answer in [0, 1] {
+                {
+                    let mut script = script.lock().unwrap();
+                    script.calls.clear();
+                    script.answers = [json!(answer)].into();
+                }
+                let result = if answer == 1 {
+                    let failure = run(&graph, ctx).unwrap_err();
+                    let diagnostic = "input n4.prompt has competing wires from left.text, right.text. Leave one active wire for this input.";
+                    let result = failure.result.unwrap();
+                    assert_eq!(result.nodes["n4"].error.as_deref(), Some(diagnostic));
+                    result
+                } else {
+                    let result = run(&graph, ctx).unwrap_or_else(|e| panic!("{}", e.message));
+                    assert_eq!(result.nodes["n4"].status, "skipped");
+                    result
+                };
+                assert_eq!(result.cost_usd, 0.001);
+                assert_eq!(script.lock().unwrap().calls, ["n2"]);
+            }
+        });
+    }
 }
