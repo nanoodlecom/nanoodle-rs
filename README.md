@@ -95,6 +95,8 @@ Execution semantics worth knowing:
 
 - Loading a workflow reports wires with missing nodes or undeclared source or
   destination ports. The run stops before any node executes if a wire is invalid.
+- An input accepts one active source. Rust reports competing wires before the
+  consuming step runs and allows mutually exclusive Decide routes to share an input.
 - LLM audio and video wires are recognized on load and stop Rust runs before any
   node executes. The editor and player can use those inputs.
 - A node whose upstream errored is itself recorded `error`

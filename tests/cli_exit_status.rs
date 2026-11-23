@@ -234,6 +234,82 @@ fn malformed_wires_are_reported_before_a_provider_can_use_the_fallback() {
 }
 
 #[test]
+fn competing_prompt_wires_fail_before_the_provider_in_either_order() {
+    let mut graph = json!({
+        "nodes": [
+            {"id":"source","type":"text","fields":{"text":"source value"}},
+            {"id":"other","type":"text","fields":{"text":"other value"}},
+            {"id":"request","type":"llm","fields":{"model":"fixture","prompt":"stored fallback"}},
+        ],
+        "links": [
+            {"from":{"node":"source","port":"text"},"to":{"node":"request","port":"prompt"}},
+            {"from":{"node":"other","port":"text"},"to":{"node":"request","port":"prompt"}},
+        ],
+    });
+    let diagnostic = "input request.prompt has competing wires from other.text, source.text. Leave one active wire for this input.";
+    for name in ["competing-inputs", "competing-inputs-reversed"] {
+        let file = GraphFile::new(name, &graph.to_string());
+        let (status, report) = file.invoke("load");
+        assert_eq!(status, 0);
+        assert_eq!(report["loadWarnings"], json!([diagnostic]));
+        let request = with_chat_provider(|base_url| {
+            let output = file.command("run").args(["--base-url", base_url, "--api-key", "fixture"])
+                .output().unwrap();
+            let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(output.status.code(), Some(1), "{report}");
+            assert_eq!(report["runError"], diagnostic);
+            assert_eq!(report["nodes"], json!({}));
+            assert_eq!(report["cost"], Value::Null);
+        });
+        assert!(request.is_none(), "unexpected provider request: {request:?}");
+        graph["links"].as_array_mut().unwrap().reverse();
+    }
+
+    graph["links"][1] = graph["links"][0].clone();
+    let file = GraphFile::new("repeated-same-source", &graph.to_string());
+    let (_, report) = file.invoke("load");
+    assert_eq!(report["loadWarnings"], json!([]));
+    let request = with_chat_provider(|base_url| {
+        let output = file.command("run").args(["--base-url", base_url, "--api-key", "fixture"])
+            .output().unwrap();
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(output.status.success(), "{report}");
+        assert_eq!(report["outputs"]["request"], "provider output");
+    }).expect("repeated wires from the same source should send one request");
+    let (_, body) = request.split_once("\r\n\r\n").unwrap();
+    let body: Value = serde_json::from_str(body).unwrap();
+    assert_eq!(body["messages"][1]["content"], "source value");
+}
+
+#[test]
+fn distinct_image_handles_are_collected_as_separate_inputs() {
+    let file = GraphFile::new("distinct-image-inputs", &json!({
+        "nodes": [
+            {"id":"first","type":"upload","fields":{"image":"data:image/png;base64,YQ=="}},
+            {"id":"second","type":"upload","fields":{"image":"data:image/png;base64,Yg=="}},
+            {"id":"chat","type":"llm","fields":{"model":"fixture","prompt":"what is shown?"}},
+        ],
+        "links": [
+            {"from":{"node":"first","port":"image"},"to":{"node":"chat","port":"img"}},
+            {"from":{"node":"second","port":"image"},"to":{"node":"chat","port":"img1"}},
+        ],
+    }).to_string());
+    let request = with_chat_provider(|base_url| {
+        let output = file.command("run").args(["--base-url", base_url, "--api-key", "fixture"])
+            .output().unwrap();
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(output.status.success(), "{report}");
+        assert_eq!(report["loadWarnings"], json!([]));
+    }).unwrap();
+    let (_, body) = request.split_once("\r\n\r\n").unwrap();
+    let body: Value = serde_json::from_str(body).unwrap();
+    let mut images: Vec<_> = body["messages"][1]["content"].as_array().unwrap().iter()
+        .filter_map(|part| part["image_url"]["url"].as_str()).collect();
+    images.sort_unstable();
+    assert_eq!(images, ["data:image/png;base64,YQ==", "data:image/png;base64,Yg=="]);
+}
+
+#[test]
 fn unsupported_llm_media_wires_are_inspectable_and_stop_before_a_provider_call() {
     for (source_type, port, media) in [
         ("aupload", "audio", "data:audio/wav;base64,AAAA"),

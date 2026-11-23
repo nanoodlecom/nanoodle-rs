@@ -6,7 +6,7 @@
 //! is the contract. See `../executor-core/SPEC.md` and `RUST-BRIEF.md`.
 
 use serde_json::{json, Map, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::time::{Duration, Instant};
 
@@ -284,6 +284,25 @@ fn wire_issue(by_id: &HashMap<&str, &Node>, link: &Link) -> Option<String> {
     undeclared_source_port(source, link).or_else(|| undeclared_target_port(target, link))
 }
 
+fn has_repeated_input(links: &[Link]) -> bool {
+    let mut seen = HashSet::new();
+    links.iter().any(|link| !seen.insert((link.to_node.as_str(), link.to_port.as_str())))
+}
+
+fn competing_input_issues<'a>(links: impl IntoIterator<Item = &'a Link>) -> Vec<String> {
+    let mut inputs: BTreeMap<_, BTreeSet<_>> = BTreeMap::new();
+    for link in links {
+        inputs.entry((link.to_node.as_str(), link.to_port.as_str()))
+            .or_default().insert((link.from_node.as_str(), link.from_port.as_str()));
+    }
+    inputs.into_iter().filter(|(_, sources)| sources.len() > 1)
+        .map(|((node, port), sources)| {
+            let mut sources: Vec<_> = sources.into_iter().map(|(node, port)| format!("{node}.{port}")).collect();
+            sources.sort_unstable();
+            format!("input {node}.{port} has competing wires from {}. Leave one active wire for this input.", sources.join(", "))
+        }).collect()
+}
+
 #[derive(Debug)]
 pub struct Graph {
     pub nodes: Vec<Node>,
@@ -420,7 +439,18 @@ pub fn materialize(data: &Value) -> Result<Graph> {
             links.push(link);
         }
     }
-    Ok(Graph { nodes, links, warnings })
+    let mut graph = Graph { nodes, links, warnings };
+    if has_repeated_input(&graph.links) {
+        // Keep all links. A user can inspect and repair the target before the next run.
+        let by_id: HashMap<_, _> = graph.nodes.iter().map(|node| (node.id.as_str(), node)).collect();
+        if let Ok(order) = topo_sort(&graph) {
+            if let Ok(branches) = BranchPlan::new(&graph, &order, &by_id) {
+                let issues = preflight_competing_inputs(&graph, &order, &by_id, &branches);
+                graph.warnings.extend(issues);
+            }
+        }
+    }
+    Ok(graph)
 }
 
 fn node_id_str(v: Option<&Value>) -> String {
@@ -1640,12 +1670,8 @@ fn run_local_node(
 enum Gathered {
     /// comment nodes never run.
     Comment,
-    /// A direct upstream errored: this node errors too, naming it
-    /// (JS/Py "upstream failed: X" — it cascades down the chain).
-    UpstreamFailed(String),
-    /// Every inbound wire comes from an onError:"skip" node that failed:
-    /// JS errors "all inputs were skipped after failing: X, Y".
-    AllSkipped(String),
+    /// An upstream failure or competing active wires prevent execution.
+    InputError(String),
     /// An upstream gated shut (or was gate-skipped): skipped, unbilled.
     Blocked,
     /// Inputs + the effective node (field overrides applied).
@@ -1674,8 +1700,14 @@ fn gather_step<'a>(
     }
     let mut failed: Option<String> = None;
     let mut skipped_err: Vec<String> = Vec::new();
+    let mut skipped_in = 0usize;
     let mut gate_blocked = false;
     let mut inbound = 0usize;
+    let mut repeated_input = false;
+    let emitted_value = |link: &Link| outputs_by_node
+        .get(&link.from_node)
+        .and_then(|out| out.get(&link.from_port))
+        .filter(|value| !value.is_null());
     for l in links.clone() {
         inbound += 1;
         if let Some(rec) = records.get(&l.from_node) {
@@ -1698,6 +1730,7 @@ fn gather_step<'a>(
                 }
                 // onError:"skip" records carry their error under "skipped"
                 "skipped" if rec.error.is_some() => {
+                    skipped_in += 1;
                     let name = src_name();
                     if !skipped_err.contains(&name) {
                         skipped_err.push(name);
@@ -1707,12 +1740,8 @@ fn gather_step<'a>(
                 _ => {}
             }
         }
-        let v = outputs_by_node
-            .get(&l.from_node)
-            .and_then(|m| m.get(&l.from_port))
-            .cloned()
-            .unwrap_or(Value::Null);
-        inputs.insert(l.to_port.clone(), v.clone());
+        let Some(v) = emitted_value(l).cloned() else { continue; };
+        repeated_input |= inputs.insert(l.to_port.clone(), v.clone()).is_some();
         // The endpoint resolver needs the authored base URL and mode even
         // when a wire supplies a relative path or leaves its mode blank.
         let endpoint_route = node.ty == "endpoint" && matches!(l.to_port.as_str(), "url" | "mode");
@@ -1727,23 +1756,19 @@ fn gather_step<'a>(
         }
     }
     if let Some(name) = failed {
-        return Gathered::UpstreamFailed(name);
+        return Gathered::InputError(format!("upstream failed: {name}"));
     }
-    if inbound > 0 && skipped_err.len() > 0 {
-        let skipped_sources = links
-            .filter(|l| {
-                records
-                    .get(&l.from_node)
-                    .map(|r| r.status == "skipped" && r.error.is_some())
-                    .unwrap_or(false)
-            })
-            .count();
-        if skipped_sources == inbound {
-            return Gathered::AllSkipped(skipped_err.join(", "));
-        }
+    if inbound > 0 && skipped_in == inbound {
+        return Gathered::InputError(format!("all inputs were skipped after failing: {}", skipped_err.join(", ")));
     }
     if gate_blocked {
         return Gathered::Blocked;
+    }
+    if repeated_input {
+        let emitted = links.filter(|link| emitted_value(link).is_some());
+        if let Some(issue) = competing_input_issues(emitted).into_iter().next() {
+            return Gathered::InputError(issue);
+        }
     }
     Gathered::Ready {
         node: effective.unwrap_or_else(|| node.clone()),
@@ -1766,17 +1791,7 @@ fn execute_step(g: Gathered, ctx: &Ctx) -> (NodeRecord, Map<String, Value>, bool
             true,
             None,
         ),
-        Gathered::UpstreamFailed(name) => {
-            let msg = format!("upstream failed: {}", name);
-            (
-                NodeRecord { status: "error".into(), out: Map::new(), error: Some(msg.clone()), cost: None },
-                Map::new(),
-                true,
-                Some(msg),
-            )
-        }
-        Gathered::AllSkipped(names) => {
-            let msg = format!("all inputs were skipped after failing: {}", names);
+        Gathered::InputError(msg) => {
             (
                 NodeRecord { status: "error".into(), out: Map::new(), error: Some(msg.clone()), cost: None },
                 Map::new(),
@@ -1896,6 +1911,54 @@ impl<'a> BranchPlan<'a> {
             .and_then(Value::as_str);
         matches!(selected, Some("yes" | "no")) && selected != Some(link.from_port.as_str())
     }
+}
+
+fn preflight_competing_inputs(
+    graph: &Graph,
+    order: &[String],
+    by_id: &HashMap<&str, &Node>,
+    branches: &BranchPlan<'_>,
+) -> Vec<String> {
+    // A legacy Decide gate can skip its downstream regardless of which ports they receive.
+    let wired: HashSet<_> = graph.links.iter().filter(|link| matches!(link.to_port.as_str(), "mode" | "gate"))
+        .map(|link| (link.to_node.as_str(), link.to_port.as_str())).collect();
+    let gates: HashSet<_> = graph.nodes.iter().filter(|node| {
+        let id = node.id.as_str();
+        node.ty == "decide" && !branch_decider(node)
+            && (flag_is_true(node.fields.get("gate")) || wired.contains(&(id, "gate")))
+            && (node.field_str("mode").as_deref() == Some("yesno") || wired.contains(&(id, "mode")))
+    }).map(|node| node.id.as_str()).collect();
+    let mut conditional: HashSet<_> = branches.selectors.keys().copied().collect();
+    if !gates.is_empty() {
+        let mut outgoing: HashMap<_, Vec<_>> = HashMap::new();
+        for link in &graph.links {
+            outgoing.entry(link.from_node.as_str()).or_default().push(link.to_node.as_str());
+        }
+        for id in order.iter().map(String::as_str) {
+            if gates.contains(id) || conditional.contains(id) {
+                conditional.extend(outgoing.get(id).into_iter().flatten().copied());
+            }
+        }
+    }
+
+    competing_input_issues(graph.links.iter().filter(|link| {
+        if conditional.contains(link.to_node.as_str()) || wire_issue(by_id, link).is_some() {
+            return false;
+        }
+        let source = by_id[link.from_node.as_str()];
+        if source.fields.get("onError").and_then(Value::as_str) == Some("skip") {
+            return false;
+        }
+        // Some declared ports only emit in particular modes or when enough media exists.
+        match source.ty.as_str() {
+            "endpoint" | "render3d" => false,
+            "vframes" => link.from_port == "frame1",
+            "sprite-stack-render" => link.from_port == "image",
+            "edit" | "inpaint" => link.from_port != "layers",
+            "decide" => matches!(link.from_port.as_str(), "text" | "image"),
+            _ => true,
+        }
+    }))
 }
 
 /// Run a materialized graph; unknown types fail fast exactly like JS run().
@@ -2122,6 +2185,11 @@ pub fn run(graph: &Graph, ctx: &Ctx) -> std::result::Result<RunResult, RunFailur
     }
     let order = topo_sort(graph)?; // cycle check (names the cyclic nodes)
     let branches = BranchPlan::new(graph, &order, &by_id)?;
+    if has_repeated_input(&graph.links) {
+        if let Some(issue) = preflight_competing_inputs(graph, &order, &by_id, &branches).into_iter().next() {
+            return Err(NanoodleError(issue).into());
+        }
+    }
     let total = graph.nodes.len();
 
     // Required-input validation (JS workflow.run): a derived input whose
