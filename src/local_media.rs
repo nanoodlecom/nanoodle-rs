@@ -18,8 +18,8 @@ use crate::{
 };
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
-use std::io::Read;
-use std::path::PathBuf;
+use std::io::{self, Read};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -30,6 +30,8 @@ const MAX_WAV_SAMPLES: usize = 50_000_000;
 const MEDIA_INLINE_MAX: usize = 4_610_334; // JS 4.4 * 1024 * 1024, compared on data-URL length
 const INLINE_IMAGE_BUDGET: f64 = MEDIA_INLINE_MAX as f64 - 128.0 * 1024.0;
 const PROC_TIMEOUT: Duration = Duration::from_millis(120_000);
+const PROC_STDOUT_MAX: u64 = 32 * 1024 * 1024;
+const PROC_STDERR_MAX: usize = 64 * 1024;
 
 fn err(msg: impl Into<String>) -> NanoodleError {
     NanoodleError(msg.into())
@@ -237,13 +239,26 @@ fn run_proc(bin: &str, args: &[String]) -> Result<String> {
     let mut err_pipe = child.stderr.take().unwrap();
     let t_out = std::thread::spawn(move || {
         let mut v = Vec::new();
-        let _ = out_pipe.read_to_end(&mut v);
+        let _ = out_pipe.by_ref().take(PROC_STDOUT_MAX).read_to_end(&mut v);
+        // Keep draining so a large timestamp listing does not block its subprocess.
+        let _ = io::copy(&mut out_pipe, &mut io::sink());
         v
     });
     let t_err = std::thread::spawn(move || {
-        let mut v = Vec::new();
-        let _ = err_pipe.read_to_end(&mut v);
-        v
+        let mut tail = Vec::new();
+        let mut chunk = [0; 8192];
+        loop {
+            let n = match err_pipe.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            };
+            let discard = (tail.len() + n).saturating_sub(PROC_STDERR_MAX);
+            drop(tail.drain(..discard));
+            tail.extend_from_slice(&chunk[..n]);
+        }
+        tail
     });
     let start = Instant::now();
     let status = loop {
@@ -1618,14 +1633,140 @@ pub(crate) fn vframes_count(node: &Node) -> i64 {
     js_parse_int(field(node, "frames")).unwrap_or(1).clamp(1, MAX_FRAMES)
 }
 
+const MAX_SAFE_INTEGER: i64 = (1 << 53) - 1;
+const FRAME_TIME_EPSILON: f64 = 1e-9;
+
+struct FrameRange {
+    start: f64,
+    end: f64,
+    stride: Option<u64>,
+}
+
+impl FrameRange {
+    fn from_node(node: &Node) -> Result<Option<Self>> {
+        let setting = |name| field(node, name).filter(|v| !v.is_null() && v.as_str() != Some(""));
+        let seconds = |name| {
+            setting(name).map(|value| {
+                js_number(Some(value))
+                    .filter(|n| n.is_finite() && *n >= 0.0)
+                    .ok_or_else(|| err(format!("{name} must be a non-negative time in seconds")))
+            }).transpose()
+        };
+        let start = seconds("startSec")?;
+        let end = seconds("endSec")?;
+        let stride = setting("stride").map(|value| {
+            js_number(Some(value))
+                .filter(|n| (1.0..=MAX_SAFE_INTEGER as f64).contains(n) && n.fract() == 0.0)
+                .map(|n| n as u64)
+                .ok_or_else(|| err("stride must be a positive integer"))
+        }).transpose()?;
+        if stride.is_none() && start.is_none() && end.is_none() {
+            return Ok(None);
+        }
+
+        let start = start.unwrap_or(0.0);
+        let end = end.unwrap_or(f64::INFINITY);
+        if end < start {
+            return Err(err("endSec must be at or after startSec"));
+        }
+        Ok(Some(Self { start, end, stride }))
+    }
+}
+
+fn extract_indexed_frames(
+    in_path: &Path,
+    dir: &TempDir,
+    count: usize,
+    gap: f64,
+    from_end: bool,
+    range: FrameRange,
+) -> Result<Vec<String>> {
+    let probe = run_proc("ffprobe", &[
+        "-v".into(), "error".into(), "-select_streams".into(), "v:0".into(),
+        "-show_frames".into(), "-show_entries".into(),
+        "stream=time_base:frame=best_effort_timestamp".into(), "-of".into(), "json".into(),
+        in_path.to_string_lossy().into_owned(),
+    ])?;
+    let probe: Value = serde_json::from_str(&probe)
+        .map_err(|_| err("could not read the video frame timestamps"))?;
+    let no_timestamps = || err("video has no readable frame timestamps");
+    let (units, scale) = probe.pointer("/streams/0/time_base").and_then(Value::as_str)
+        .and_then(|base| base.split_once('/'))
+        .and_then(|(units, scale)| Some((units.parse::<f64>().ok()?, scale.parse::<f64>().ok()?)))
+        .filter(|(units, scale)| *units > 0.0 && *scale > 0.0)
+        .ok_or_else(no_timestamps)?;
+    let frames = probe["frames"].as_array().ok_or_else(no_timestamps)?;
+    let timestamp = |frame: &Value| frame["best_effort_timestamp"].as_i64()
+        .filter(|pts| (-MAX_SAFE_INTEGER..=MAX_SAFE_INTEGER).contains(pts));
+    let origin = frames.first().and_then(timestamp).ok_or_else(no_timestamps)?;
+
+    let mut available = Vec::new();
+    let mut previous = origin;
+    for (index, frame) in frames.iter().enumerate() {
+        let pts = timestamp(frame).filter(|&pts| pts >= previous)
+            .ok_or_else(|| err("video frame timestamps are missing or out of order"))?;
+        previous = pts;
+        let time = (pts - origin) as f64 * units / scale;
+        if time > range.end + FRAME_TIME_EPSILON {
+            break;
+        }
+        if time + FRAME_TIME_EPSILON >= range.start {
+            available.push((index, time));
+        }
+    }
+    if available.is_empty() {
+        return Err(err("no video frames in the requested time range"));
+    }
+    if from_end {
+        available.reverse();
+    }
+
+    let mut selected = Vec::with_capacity(count);
+    let mut last_time: Option<f64> = None;
+    for (offset, (index, time)) in available.into_iter().enumerate() {
+        let skip = match range.stride {
+            Some(stride) => offset as u64 % stride != 0,
+            None => last_time.is_some_and(|last| (time - last).abs() + FRAME_TIME_EPSILON < gap),
+        };
+        if skip {
+            continue;
+        }
+        selected.push(format!("eq(n,{index})"));
+        last_time = Some(time);
+        if selected.len() == count {
+            break;
+        }
+    }
+
+    // Decode the same first stream in display order and select frame numbers.
+    // PTS gaps and seek rounding must not alter the chosen source frames.
+    run_proc("ffmpeg", &[
+        "-y".into(), "-i".into(), in_path.to_string_lossy().into_owned(),
+        "-map".into(), "0:v:0".into(), "-vf".into(), format!("select='{}'", selected.join("+")),
+        "-fps_mode".into(), "passthrough".into(), "-frames:v".into(), selected.len().to_string(),
+        "-q:v".into(), "2".into(), "-start_number".into(), "1".into(),
+        dir.path("frame-%d.jpg").to_string_lossy().into_owned(),
+    ])?;
+    (0..selected.len()).map(|i| {
+        // FFmpeg writes selected frames in forward order even when sampling from the end.
+        let file = if from_end { selected.len() - i } else { i + 1 };
+        data_url_from_file(&dir.path(&format!("frame-{file}.jpg")), Some("image/jpeg"))
+    }).collect()
+}
+
 /// extractVideoFrames mirror.
-fn extract_video_frames(url: &str, count: i64, gap_in: Option<f64>, dir_field: &str) -> Result<Vec<String>> {
+fn extract_video_frames(
+    url: &str, count: i64, gap_in: Option<f64>, from_end: bool, range: Option<FrameRange>,
+) -> Result<Vec<String>> {
     let gap = match gap_in {
         Some(g) if g.is_finite() => g.max(0.0),
         _ => 0.5,
     };
     let dir = TempDir::new()?;
     let in_path = write_input(&dir, "in", url)?;
+    if let Some(range) = range {
+        return extract_indexed_frames(&in_path, &dir, count as usize, gap, from_end, range);
+    }
     let probe = run_proc(
         "ffprobe",
         &[
@@ -1668,7 +1809,6 @@ fn extract_video_frames(url: &str, count: i64, gap_in: Option<f64>, dir_field: &
         }
     }
     let eps = if fps > 0.0 { (1.5 / fps).max(0.04) } else { 0.1 };
-    let from_end = dir_field == "end";
     let grab = |t: f64, out_path: &PathBuf| -> Result<()> {
         run_proc(
             "ffmpeg",
@@ -2866,9 +3006,14 @@ pub fn run_vframes(node: &Node, inputs: &HashMap<String, Value>, _ctx: &Ctx) -> 
         _ => return Err(err("no video input")),
     };
     let frames_n = vframes_count(node);
-    let gap = js_number(field(node, "gap"));
-    let dir = node.field_str("dir").filter(|s| !s.is_empty()).unwrap_or_else(|| "end".to_string());
-    let frames = extract_video_frames(&src, frames_n, gap, &dir)?;
+    let range = FrameRange::from_node(node)?;
+    let gap = match field(node, "gap") {
+        Some(Value::Null) if range.is_some() => Some(0.0),
+        value => js_number(value),
+    };
+    let dir = node.field_str("dir").filter(|s| !s.is_empty());
+    let from_end = dir.as_deref().unwrap_or("end") == "end";
+    let frames = extract_video_frames(&src, frames_n, gap, from_end, range)?;
     let mut m = Map::new();
     for (i, f) in frames.into_iter().enumerate() {
         m.insert(format!("frame{}", i + 1), json!(f));
@@ -2881,11 +3026,15 @@ mod vframes_tests {
     use super::*;
     use crate::{materialize, run};
 
+    fn has_ffmpeg() -> bool {
+        ["ffmpeg", "ffprobe"].iter().all(|bin| {
+            Command::new(bin).arg("-version").output().is_ok()
+        })
+    }
+
     #[test]
     fn video_frames_supply_high_numbered_saved_wires() {
-        if ["ffmpeg", "ffprobe"].iter().any(|bin| {
-            Command::new(bin).arg("-version").output().is_err()
-        }) {
+        if !has_ffmpeg() {
             return;
         }
 
@@ -2924,6 +3073,88 @@ mod vframes_tests {
             assert!(frames[&port].as_str().unwrap().starts_with("data:image/jpeg;base64,"));
             assert!(result.outputs["sink"].as_str().unwrap().starts_with("data:image/jpeg;base64,"));
             assert_eq!(graph.nodes[1].fields["frames"], requested);
+        }
+    }
+
+    fn indexed_video(dir: &TempDir, variable_rate: bool) -> String {
+        for i in 0..24 {
+            let mut ppm = b"P6\n16 16\n255\n".to_vec();
+            ppm.extend([i * 10, 0, 0].repeat(16 * 16));
+            std::fs::write(dir.path(&format!("indexed-{i:02}.ppm")), ppm).unwrap();
+        }
+        let output = dir.path(if variable_rate { "variable.mp4" } else { "constant.mp4" });
+        let mut cmd = Command::new("ffmpeg");
+        cmd.args([
+            "-loglevel", "error", "-framerate", if variable_rate { "100" } else { "24" }, "-i",
+        ]).arg(dir.path("indexed-%02d.ppm"));
+        if variable_rate {
+            cmd.args([
+                "-vf", "setpts='if(lt(N,4),N*4,16+(N-4)*13)'", "-fps_mode", "vfr",
+                "-output_ts_offset", "2.5",
+            ]);
+        }
+        let encoded = cmd.args(["-c:v", "mpeg4", "-pix_fmt", "yuv420p", "-q:v", "1", "-threads", "1"])
+            .arg(&output).output().unwrap();
+        assert!(encoded.status.success(), "{}", String::from_utf8_lossy(&encoded.stderr));
+        data_url_from_file(&output, Some("video/mp4")).unwrap()
+    }
+
+    fn indexed_colors(video: &str, fields: Value) -> Result<Vec<u8>> {
+        let node = Node {
+            id: "frames".into(), ty: "vframes".into(), name: None,
+            fields: fields.as_object().unwrap().clone(), unknown: false,
+        };
+        let inputs = HashMap::from([("video".into(), json!(video))]);
+        let NodeOutcome::Done(out, _) = run_vframes(&node, &inputs, &Ctx::new("", ""))? else {
+            panic!("video frames returned a gated outcome");
+        };
+        (1..=out.len()).map(|i| {
+            let url = out[&format!("frame{i}")].as_str().unwrap();
+            let (jpeg, _) = data_url_bytes(url)?;
+            let image = sprite_jpeg::decode_jpeg(&jpeg)?;
+            Ok((image.rgba[(8 * 16 + 8) * 4] as f64 / 10.0).round() as u8)
+        }).collect()
+    }
+
+    #[test]
+    fn video_frames_sample_presented_indices_within_inclusive_ranges() {
+        if !has_ffmpeg() {
+            return;
+        }
+
+        let dir = TempDir::new().unwrap();
+        let cfr = indexed_video(&dir, false);
+        let vfr = indexed_video(&dir, true);
+        let cases = [
+            (&cfr, json!({"frames": 4, "dir": "start", "stride": 3}), vec![0, 3, 6, 9]),
+            (&cfr, json!({"frames": 8, "dir": "start", "stride": "2", "gap": 100,
+                "startSec": "0.5", "endSec": 16.0 / 24.0}), vec![12, 14, 16]),
+            (&cfr, json!({"frames": 8, "stride": 2, "startSec": 0.071, "endSec": 0.21}), vec![5, 3]),
+            (&vfr, json!({"frames": 8, "dir": "start", "stride": 2, "startSec": 0.071, "endSec": 0.43}), vec![2, 4, 6]),
+            (&vfr, json!({"frames": 8, "stride": 2, "startSec": 0.071, "endSec": 0.43}), vec![6, 4, 2]),
+            (&vfr, json!({"frames": 8, "dir": "start", "gap": 0.1, "startSec": 0.071, "endSec": 0.43}), vec![2, 5, 6]),
+            (&vfr, json!({"frames": 8, "gap": 0.1, "startSec": 0.071, "endSec": 0.43}), vec![6, 5, 4]),
+        ];
+        for (video, fields, expected) in cases {
+            assert_eq!(indexed_colors(video, fields.clone()).unwrap(), expected, "{fields}");
+        }
+        assert_eq!(
+            indexed_colors(&cfr, json!({"startSec": 0.02, "endSec": 0.03})).unwrap_err().0,
+            "no video frames in the requested time range",
+        );
+    }
+
+    #[test]
+    fn video_frames_validate_range_settings_before_decoding() {
+        // Invalid media isolates validation from the runtime FFmpeg dependency.
+        for (fields, expected) in [
+            (json!({"stride": 1.5}), "stride must be a positive integer"),
+            (json!({"stride": 9007199254740992_u64}), "stride must be a positive integer"),
+            (json!({"startSec": "-1"}), "startSec must be a non-negative time in seconds"),
+            (json!({"endSec": "NaN"}), "endSec must be a non-negative time in seconds"),
+            (json!({"startSec": 0.8, "endSec": 0.2}), "endSec must be at or after startSec"),
+        ] {
+            assert_eq!(indexed_colors("bad-video", fields).unwrap_err().0, expected);
         }
     }
 }
