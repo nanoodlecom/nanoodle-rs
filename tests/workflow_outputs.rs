@@ -8,6 +8,32 @@ use std::{
     time::Duration,
 };
 
+#[test]
+fn legacy_node_ids_and_type_aliases_materialize_with_their_wires() {
+    let graph = materialize(&json!({
+        "nodes": [
+            {"id":0,"type":"text","fields":{"text":"legacy audio prompt"}},
+            {"id":-3.5,"type":"audio"},
+            {"id":"  archived  ","type":"decide-branch"},
+        ],
+        "links": [
+            {"from":{"node":0,"port":"text"},"to":{"node":-3.5,"port":"text"}},
+            {"from":{"node":0,"port":"text"},"to":{"node":"  archived  ","port":"text"}},
+        ],
+    })).unwrap();
+    assert!(graph.warnings.is_empty(), "{:?}", graph.warnings);
+    assert_eq!(graph.nodes[0].id, "0");
+    assert_eq!(graph.nodes[1].id, "-3.5");
+    assert_eq!(graph.nodes[1].ty, "tts");
+    assert_eq!(graph.nodes[2].id, "  archived  ");
+    assert_eq!(graph.nodes[2].ty, "decide");
+    assert_eq!(graph.nodes[2].fields["branch"], true);
+    assert_eq!(graph.links[0].from_node, "0");
+    assert_eq!(graph.links[0].to_node, "-3.5");
+    assert_eq!(graph.links[0].to_port, "prompt");
+    assert_eq!(graph.links[1].to_node, "  archived  ");
+}
+
 fn mock_endpoint(content_type: &str, body: &str, check: impl FnOnce(String)) -> bool {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();

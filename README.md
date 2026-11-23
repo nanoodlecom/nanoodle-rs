@@ -93,6 +93,8 @@ three-way comparison.
 
 Execution semantics worth knowing:
 
+- A malformed node record stops loading. The error identifies its position in
+  the nodes array and the required shape of the record, ID, or type.
 - Loading a workflow reports wires with missing nodes or undeclared source or
   destination ports. The run stops before any node executes if a wire is invalid.
 - An input accepts one active source. Rust reports competing wires before the

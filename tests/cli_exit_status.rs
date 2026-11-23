@@ -368,6 +368,71 @@ fn invalid_file_exits_with_failure_and_reports_the_load_error() {
 }
 
 #[test]
+fn malformed_node_records_report_their_position_before_any_provider_request() {
+    let invalid_record = "must be an object";
+    let invalid_id = "has a missing or invalid id (expected a non-empty string or finite number)";
+    let invalid_type = "has a missing or invalid type (expected a non-empty string)";
+    for (name, node, reason) in [
+        ("null-record", Value::Null, invalid_record),
+        ("array-record", json!([]), invalid_record),
+        ("scalar-record", json!("Text"), invalid_record),
+        ("missing-id", json!({"type":"text"}), invalid_id),
+        ("null-id", json!({"id":null,"type":"text"}), invalid_id),
+        ("boolean-id", json!({"id":false,"type":"text"}), invalid_id),
+        ("object-id", json!({"id":{},"type":"text"}), invalid_id),
+        ("array-id", json!({"id":[],"type":"text"}), invalid_id),
+        ("blank-id", json!({"id":" \t ","type":"text"}), invalid_id),
+        ("missing-type", json!({"id":"damaged"}), invalid_type),
+        ("null-type", json!({"id":"damaged","type":null}), invalid_type),
+        ("number-type", json!({"id":"damaged","type":37}), invalid_type),
+        ("blank-type", json!({"id":"damaged","type":" \n "}), invalid_type),
+    ] {
+        let file = GraphFile::new(name, &json!({
+            "nodes": [
+                {"id":"request","type":"llm","fields":{"model":"fixture","prompt":"valid sibling"}},
+                node,
+            ],
+        }).to_string());
+        let diagnostic = format!("node at position 2 {reason}");
+        let expected = json!({"loadError":diagnostic});
+        assert_eq!(file.invoke("load"), (1, expected.clone()), "{name}");
+        let request = with_chat_provider(|base_url| {
+            let output = file.command("run").args(["--base-url", base_url, "--api-key", "fixture"])
+                .output().unwrap();
+            let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(output.status.code(), Some(1), "{name}: {report}");
+            assert_eq!(report, expected, "{name}");
+        });
+        assert!(request.is_none(), "{name}: unexpected provider request: {request:?}");
+    }
+}
+
+#[test]
+fn well_formed_unknown_node_types_remain_inspectable() {
+    for ty in ["future-node-fixture", "constructor"] {
+        let file = GraphFile::new(ty, &json!({
+            "nodes": [
+                {"id":"unknown","type":ty},
+                {"id":"request","type":"llm","fields":{"model":"fixture","prompt":"valid sibling"}},
+            ],
+        }).to_string());
+        let (status, report) = file.invoke("load");
+        assert_eq!(status, 0, "{report}");
+        assert_eq!(report["loadOnly"]["nodeCount"], 2);
+        assert_eq!(report["loadOnly"]["nWarnings"], 1);
+        assert!(report["loadWarnings"][0].as_str().unwrap().contains(ty));
+        let request = with_chat_provider(|base_url| {
+            let output = file.command("run").args(["--base-url", base_url, "--api-key", "fixture"])
+                .output().unwrap();
+            let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(output.status.code(), Some(1), "{report}");
+            assert!(report["runError"].as_str().unwrap().contains(&format!("unknown node type '{ty}'")));
+        });
+        assert!(request.is_none(), "unexpected provider request: {request:?}");
+    }
+}
+
+#[test]
 fn failed_run_exits_with_failure_and_keeps_partial_results() {
     let file = GraphFile::new(
         "failed-resize",
