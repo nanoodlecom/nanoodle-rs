@@ -1,5 +1,14 @@
 use serde_json::{json, Value};
-use std::{fs, path::PathBuf, process::Command};
+use std::{
+    fs,
+    io::{self, BufRead, BufReader, Read, Write},
+    net::TcpListener,
+    path::PathBuf,
+    process::{Command, Output},
+    sync::mpsc::{self, RecvTimeoutError},
+    thread,
+    time::Duration,
+};
 
 struct GraphFile(PathBuf);
 
@@ -13,12 +22,14 @@ impl GraphFile {
         Self(path)
     }
 
+    fn command(&self, mode: &str) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_nanoodle-rs"));
+        command.arg(mode).arg(&self.0);
+        command
+    }
+
     fn invoke(&self, mode: &str) -> (i32, Value) {
-        let output = Command::new(env!("CARGO_BIN_EXE_nanoodle-rs"))
-            .arg(mode)
-            .arg(&self.0)
-            .output()
-            .unwrap();
+        let output = self.command(mode).output().unwrap();
         let report = serde_json::from_slice(&output.stdout).unwrap_or_else(|err| {
             panic!(
                 "could not parse {mode} report: {err}; stdout: {:?}",
@@ -27,6 +38,143 @@ impl GraphFile {
         });
         (output.status.code().unwrap(), report)
     }
+}
+
+fn assert_usage_error(output: Output, message: &str) {
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(output.stdout.is_empty(), "{:?}", output.stdout);
+    assert!(stderr.contains(message), "{stderr}");
+}
+
+#[test]
+fn rejects_unknown_arguments_and_missing_option_values() {
+    let graph = GraphFile::new("options", "{\"nodes\":[]}");
+    for (mode, args, expected) in [
+        ("run", &["--unknown"][..], "unknown option --unknown"),
+        ("run", &["extra"][..], "unexpected argument"),
+        ("run", &["--base-url"][..], "--base-url requires a value"),
+        ("run", &["--api-key"][..], "--api-key requires a value"),
+        ("run", &["--api-key", ""][..], "--api-key requires a value"),
+        ("run", &["--catalog"][..], "--catalog requires a value"),
+        (
+            "run",
+            &["--catalog", "--api-key", "fixture"][..],
+            "--catalog requires a value",
+        ),
+        (
+            "load",
+            &["--catalog", "catalog.json"][..],
+            "load takes no options",
+        ),
+    ] {
+        assert_usage_error(graph.command(mode).args(args).output().unwrap(), expected);
+    }
+}
+
+fn with_chat_provider(check: impl FnOnce(&str)) -> Option<String> {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    thread::scope(|scope| {
+        let (keep_serving, stop) = mpsc::channel::<()>();
+        let server = scope.spawn(move || {
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                        if stop.recv_timeout(Duration::from_millis(5)) == Err(RecvTimeoutError::Disconnected) {
+                            return None;
+                        }
+                    }
+                    Err(err) => panic!("{err}"),
+                }
+            };
+            stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let mut reader = BufReader::new(&mut stream);
+            let mut headers = String::new();
+            let mut content_length = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line.trim().is_empty() {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':') {
+                    if name.eq_ignore_ascii_case("content-length") {
+                        content_length = value.trim().parse().unwrap();
+                    }
+                }
+                headers.push_str(&line);
+            }
+            io::copy(&mut reader.take(content_length), &mut io::sink()).unwrap();
+            let body = r#"{"choices":[{"message":{"content":"provider output"}}]}"#;
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            Some(headers)
+        });
+        check(&base_url);
+        drop(keep_serving);
+        server.join().unwrap()
+    })
+}
+
+fn chat_graph(name: &str) -> GraphFile {
+    GraphFile::new(
+        name,
+        r#"{"nodes":[{"id":"chat","type":"llm","name":"Result","fields":{"model":"fixture","prompt":"hello"}}]}"#,
+    )
+}
+
+#[test]
+fn rejects_bad_catalogs_before_calling_a_provider() {
+    let graph = chat_graph("model-with-invalid-catalog");
+    let missing = GraphFile::new("missing-catalog", "{}");
+    fs::remove_file(&missing.0).unwrap();
+    let invalid = GraphFile::new("invalid-catalog", "{");
+    let array = GraphFile::new("array-catalog", "[]");
+    let bad_section = GraphFile::new("bad-catalog-section", r#"{"chat":{}}"#);
+    for (catalog, message) in [
+        (missing, "cannot read --catalog"),
+        (invalid, "invalid JSON in --catalog"),
+        (array, "expected a JSON object"),
+        (bad_section, "catalog section 'chat' must be an array"),
+    ] {
+        let request = with_chat_provider(|base_url| {
+            let output = graph
+                .command("run")
+                .args(["--base-url", base_url, "--api-key", "fixture", "--catalog"])
+                .arg(&catalog.0)
+                .output()
+                .unwrap();
+            assert_usage_error(output, message);
+        });
+        assert!(
+            request.is_none(),
+            "unexpected provider request: {request:?}"
+        );
+    }
+}
+
+#[test]
+fn run_accepts_the_documented_provider_options() {
+    let graph = chat_graph("model-with-valid-catalog");
+    let catalog = GraphFile::new("catalog", r#"{"chat":[{"id":"fixture"}],"metadata":{}}"#);
+    let request = with_chat_provider(|base_url| {
+        let output = graph
+            .command("run")
+            .args(["--api-key", "fixture", "--base-url", base_url, "--catalog"])
+            .arg(&catalog.0)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{:?}", output.stderr);
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["outputs"]["Result"], "provider output");
+    })
+    .unwrap();
+    assert!(request.starts_with("POST /api/v1/chat/completions HTTP/1.1\r\n"));
+    assert!(request
+        .to_ascii_lowercase()
+        .contains("\r\nauthorization: bearer fixture\r\n"));
 }
 
 impl Drop for GraphFile {

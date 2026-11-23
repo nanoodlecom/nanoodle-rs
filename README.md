@@ -54,7 +54,9 @@ The run report includes the outputs, node statuses, cost, and errors.
 If the run fails, it includes the error and any results produced so far.
 Load and run failures exit with status 1 and still write a JSON report to stdout.
 Use `--base-url` for a compatible provider or `--catalog catalog.json` to
-supply a local model catalog.
+supply a local model catalog. Catalog files must contain a JSON object with
+arrays for any model sections they include, such as `chat` or `video`.
+Invalid arguments or catalog files exit with status 2 and write a diagnostic to stderr.
 
 ## Sprite stacking
 
