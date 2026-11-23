@@ -95,6 +95,9 @@ Execution semantics worth knowing:
   gate instead skips its downstream, unbilled.
 - `fields.onError: "skip"` records a failure as `skipped` and lets
   dependents run on their remaining inputs.
+- Video → frames uses `ffmpeg` and `ffprobe` on `PATH` and exposes up to 48
+  image ports (`frame1` through `frame48`). A saved wire to a higher frame
+  raises the requested count up to that limit.
 - Every model-driven runner requires `fields.model` — there are no silent
   defaults (exceptions: model3d defaults to Tripo, cleanvoice has a
   default model).

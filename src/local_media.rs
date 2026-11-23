@@ -24,7 +24,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const MAX_FRAMES: i64 = 12;
+const MAX_FRAMES: i64 = 48;
 const MAX_IMAGE_DIM: u32 = 8192;
 const MAX_WAV_SAMPLES: usize = 50_000_000;
 const MEDIA_INLINE_MAX: usize = 4_610_334; // JS 4.4 * 1024 * 1024, compared on data-URL length
@@ -1606,9 +1606,20 @@ fn trim_audio_to_wav(url: &str, start: f64, length: f64, target_rate: u32, whole
 
 // ---------------------------------------------------------------- vframes
 
+pub(crate) fn wired_frame_floor(port: &str) -> Option<i64> {
+    let digits = port.strip_prefix("frame")?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(digits.parse::<i64>().unwrap_or(MAX_FRAMES).clamp(1, MAX_FRAMES))
+}
+
+pub(crate) fn vframes_count(node: &Node) -> i64 {
+    js_parse_int(field(node, "frames")).unwrap_or(1).clamp(1, MAX_FRAMES)
+}
+
 /// extractVideoFrames mirror.
-fn extract_video_frames(url: &str, count_in: i64, gap_in: Option<f64>, dir_field: &str) -> Result<Vec<String>> {
-    let count = if count_in == 0 { 1 } else { count_in }.clamp(1, MAX_FRAMES);
+fn extract_video_frames(url: &str, count: i64, gap_in: Option<f64>, dir_field: &str) -> Result<Vec<String>> {
     let gap = match gap_in {
         Some(g) if g.is_finite() => g.max(0.0),
         _ => 0.5,
@@ -2854,7 +2865,7 @@ pub fn run_vframes(node: &Node, inputs: &HashMap<String, Value>, _ctx: &Ctx) -> 
         Some(s) if !s.is_empty() => s,
         _ => return Err(err("no video input")),
     };
-    let frames_n = js_parse_int(field(node, "frames")).unwrap_or(1);
+    let frames_n = vframes_count(node);
     let gap = js_number(field(node, "gap"));
     let dir = node.field_str("dir").filter(|s| !s.is_empty()).unwrap_or_else(|| "end".to_string());
     let frames = extract_video_frames(&src, frames_n, gap, &dir)?;
@@ -2863,6 +2874,58 @@ pub fn run_vframes(node: &Node, inputs: &HashMap<String, Value>, _ctx: &Ctx) -> 
         m.insert(format!("frame{}", i + 1), json!(f));
     }
     Ok(done(m, Some(0.0)))
+}
+
+#[cfg(test)]
+mod vframes_tests {
+    use super::*;
+    use crate::{materialize, run};
+
+    #[test]
+    fn video_frames_supply_high_numbered_saved_wires() {
+        if ["ffmpeg", "ffprobe"].iter().any(|bin| {
+            Command::new(bin).arg("-version").output().is_err()
+        }) {
+            return;
+        }
+
+        let dir = TempDir::new().unwrap();
+        let clip = dir.path("frames.mp4");
+        let encoded = Command::new("ffmpeg")
+            .args([
+                "-loglevel", "error", "-f", "lavfi", "-i", "testsrc2=size=32x32:rate=25",
+                "-t", "2", "-c:v", "mpeg4", "-threads", "1",
+            ])
+            .arg(&clip)
+            .output()
+            .unwrap();
+        assert!(encoded.status.success(), "{}", String::from_utf8_lossy(&encoded.stderr));
+        let video = data_url_from_file(&clip, Some("video/mp4")).unwrap();
+
+        for (requested, expected) in [(13, 13), (1, 48)] {
+            let port = format!("frame{expected}");
+            let graph = materialize(&json!({
+                "nodes": [
+                    {"id": "source", "type": "vupload", "fields": {"video": video}},
+                    {"id": "frames", "type": "vframes",
+                        "fields": {"frames": requested, "dir": "start", "gap": 0.04}},
+                    {"id": "sink", "type": "resize", "fields": {"width": 16, "height": 16}},
+                ],
+                "links": [
+                    {"from": {"node": "source", "port": "video"},
+                        "to": {"node": "frames", "port": "video"}},
+                    {"from": {"node": "frames", "port": port},
+                        "to": {"node": "sink", "port": "image"}},
+                ],
+            })).unwrap();
+            let result = run(&graph, &Ctx::new("", "")).unwrap_or_else(|e| panic!("{}", e.message));
+            let frames = &result.nodes["frames"].out;
+            assert_eq!(frames.len(), expected);
+            assert!(frames[&port].as_str().unwrap().starts_with("data:image/jpeg;base64,"));
+            assert!(result.outputs["sink"].as_str().unwrap().starts_with("data:image/jpeg;base64,"));
+            assert_eq!(graph.nodes[1].fields["frames"], requested);
+        }
+    }
 }
 
 /// clipN / vidN port index (JS CLIP_PORT_RE / VID_PORT_RE).

@@ -88,6 +88,7 @@ fn node_type(ty: &str) -> Option<(&'static str, &'static [&'static str], &'stati
         "ivideo" => ("Image→Video", &["image"][..], &["video"][..]),
         "model3d" => ("3D model", &["image", "model"][..], &["model"][..]),
         "vedit" => ("Video edit", &["video"][..], &["video"][..]),
+        // Frame extraction emits numbered ports. The registry supplies the primary sink port.
         "vframes" => ("Video → frames", &["video"][..], &["frame1"][..]),
         "render3d" => ("Render 3D", &["model"][..], &["image", "video"][..]),
         "combine" => ("Combine videos", &[][..], &["video"][..]),
@@ -118,8 +119,7 @@ fn dynamic_input_name(port: &str) -> bool {
     port == "audio" || port == "endframe"
 }
 
-/// ^img\d*$ | ^image\d*$ | ^vid\d*$ | ^clip\d*$ | ^ref\d*$  (JS DYNAMIC_INPUT_RES;
-/// frame ports are deliberately NOT here — vframes wiring is handled apart).
+/// ^img\d*$ | ^image\d*$ | ^vid\d*$ | ^clip\d*$ | ^ref\d*$  (JS DYNAMIC_INPUT_RES).
 fn dynamic_input_re(port: &str) -> bool {
     fn digits(s: &str) -> bool {
         !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
@@ -1575,12 +1575,17 @@ fn gather_step<'a>(
     outputs_by_node: &HashMap<String, Map<String, Value>>,
     records: &HashMap<String, NodeRecord>,
     links: impl Iterator<Item = &'a Link> + Clone,
+    frame_floor: Option<i64>,
 ) -> Gathered {
     if node.ty == "comment" {
         return Gathered::Comment;
     }
     let mut inputs: HashMap<String, Value> = HashMap::new();
     let mut effective: Option<Node> = None;
+    // Match the JS effective fields before applying any incoming field wires.
+    if let Some(floor) = frame_floor.filter(|&floor| floor > local_media::vframes_count(node)) {
+        effective.get_or_insert_with(|| node.clone()).fields.insert("frames".into(), json!(floor));
+    }
     let mut failed: Option<String> = None;
     let mut skipped_err: Vec<String> = Vec::new();
     let mut gate_blocked = false;
@@ -2052,10 +2057,18 @@ pub fn run(graph: &Graph, ctx: &Ctx) -> std::result::Result<RunResult, RunFailur
     let mut pending: HashMap<String, usize> =
         graph.nodes.iter().map(|n| (n.id.clone(), 0)).collect();
     let mut dependents: HashMap<String, Vec<String>> = HashMap::new();
+    let mut frame_floors: HashMap<&str, i64> = HashMap::new();
     {
         let mut seen: HashSet<(&str, &str)> = HashSet::new();
         for l in &graph.links {
-            if seen.insert((l.from_node.as_str(), l.to_node.as_str())) {
+            let source = l.from_node.as_str();
+            if by_id.get(source).is_some_and(|n| n.ty == "vframes") {
+                if let Some(floor) = local_media::wired_frame_floor(&l.from_port) {
+                    let count = frame_floors.entry(source).or_insert(1);
+                    *count = (*count).max(floor);
+                }
+            }
+            if seen.insert((source, l.to_node.as_str())) {
                 if let Some(p) = pending.get_mut(&l.to_node) {
                     *p += 1;
                 }
@@ -2086,6 +2099,7 @@ pub fn run(graph: &Graph, ctx: &Ctx) -> std::result::Result<RunResult, RunFailur
     let cvar = std::sync::Condvar::new();
     let dependents_ref = &dependents;
     let by_id_ref = &by_id;
+    let frame_floors_ref = &frame_floors;
     let branches_ref = &branches;
     let state_ref = &state;
     let cvar_ref = &cvar;
@@ -2107,7 +2121,10 @@ pub fn run(graph: &Graph, ctx: &Ctx) -> std::result::Result<RunResult, RunFailur
                         let links = graph.links.iter().enumerate()
                             .filter(|(idx, link)| link.to_node == id && !branches_ref.closed(*idx, link, &st))
                             .map(|(_, link)| link);
-                        gather_step(by_id_ref[id.as_str()], graph, &st.outputs_by_node, &st.records, links)
+                        gather_step(
+                            by_id_ref[id.as_str()], graph, &st.outputs_by_node, &st.records, links,
+                            frame_floors_ref.get(id.as_str()).copied(),
+                        )
                     };
                     break (id, g);
                 }
