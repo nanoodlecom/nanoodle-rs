@@ -2136,9 +2136,9 @@ pub fn run(graph: &Graph, ctx: &Ctx) -> std::result::Result<RunResult, RunFailur
             _ => continue,
         };
         let (_, _, ports) = node_type(&n.ty).unwrap_or(("", &[], &[]));
-        let value = if n.ty == "endpoint" {
-            // The endpoint runner emits the port for the resolved mode, which
-            // can come from a wire or route prefix as well as from a field.
+        let value = if matches!(n.ty.as_str(), "endpoint" | "render3d") {
+            // These runners emit the port for the resolved mode. The endpoint's
+            // mode can also come from a wire or route prefix.
             ports.iter().find_map(|port| rec.out.get(*port))
         } else {
             rec.out.get(ports[0])

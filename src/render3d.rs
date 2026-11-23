@@ -557,23 +557,10 @@ mod tests {
         (u32::from_be_bytes(png[16..20].try_into().unwrap()), u32::from_be_bytes(png[20..24].try_into().unwrap()))
     }
 
-    /// Count red/blue-dominant pixels by decoding the PNG through ffmpeg
-    /// (the crate's own heavy fallback) to raw RGBA.
-    fn color_counts(png: &[u8]) -> Option<(usize, usize)> {
-        let dir = std::env::temp_dir().join(format!("nanoodle-rs-r3d-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).ok()?;
-        let p = dir.join("f.png");
-        std::fs::write(&p, png).ok()?;
-        let raw = Command::new("ffmpeg")
-            .args(["-y", "-loglevel", "error", "-i", &p.display().to_string(), "-f", "rawvideo", "-pix_fmt", "rgba", &dir.join("f.raw").display().to_string()])
-            .status()
-            .ok()?;
-        if !raw.success() {
-            return None;
-        }
-        let bytes = std::fs::read(dir.join("f.raw")).ok()?;
+    fn color_counts(png: &[u8]) -> (usize, usize) {
+        let image = crate::local_media::decode_png(png).expect("decode Chromium canvas PNG");
         let (mut red, mut blue) = (0usize, 0usize);
-        for px in bytes.chunks_exact(4) {
+        for px in image.rgba.chunks_exact(4) {
             let (r, g, b) = (px[0] as i32, px[1] as i32, px[2] as i32);
             if r > g + 40 && r > b + 40 {
                 red += 1;
@@ -582,7 +569,7 @@ mod tests {
                 blue += 1;
             }
         }
-        Some((red, blue))
+        (red, blue)
     }
 
     #[test]
@@ -594,7 +581,7 @@ mod tests {
         fields.insert("elevation".into(), json!("0"));
         let Some(png) = render(fields.clone()) else { return };
         assert_eq!(png_dims(&png), (320, 240));
-        let (red, blue) = color_counts(&png).expect("ffmpeg decode");
+        let (red, blue) = color_counts(&png);
         assert!(red > 500, "red cube visible: {red}");
         assert!(blue > 500, "blue cube visible: {blue}");
 
@@ -602,7 +589,7 @@ mod tests {
         clip_fields.insert("clipAxis".into(), json!("x"));
         clip_fields.insert("clipPos".into(), json!("0"));
         let clipped = render(clip_fields).expect("chromium present");
-        let (cr, cb) = color_counts(&clipped).expect("ffmpeg decode");
+        let (cr, cb) = color_counts(&clipped);
         assert!(cr + cb < (red + blue) * 3 / 4, "clip cuts: {} vs {}", cr + cb, red + blue);
     }
 }

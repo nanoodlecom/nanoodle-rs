@@ -969,14 +969,14 @@ fn crc32(data: &[u8]) -> u32 {
 // ---------------------------------------------------------------- PNG codec
 
 #[derive(Clone)]
-struct PngImage {
+pub(crate) struct PngImage {
     width: u32,
     height: u32,
-    rgba: Vec<u8>, // RGBA, width*height*4
+    pub(crate) rgba: Vec<u8>, // RGBA, width*height*4
 }
 
 /// Local media operations retain their existing per-side image limit.
-fn decode_png(bytes: &[u8]) -> Result<PngImage> {
+pub(crate) fn decode_png(bytes: &[u8]) -> Result<PngImage> {
     sprite_codecs::read_png(bytes, false)
 }
 
