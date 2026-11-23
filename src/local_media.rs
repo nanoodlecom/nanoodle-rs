@@ -294,10 +294,10 @@ pub use sprite_stack::run_sprite;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-struct TempDir(PathBuf);
+pub(crate) struct TempDir(PathBuf);
 
 impl TempDir {
-    fn new() -> Result<TempDir> {
+    pub(crate) fn new() -> Result<TempDir> {
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
         for _ in 0..100 {
             let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -315,7 +315,7 @@ impl TempDir {
         }
         Err(err("couldn't create temp dir"))
     }
-    fn path(&self, name: &str) -> PathBuf {
+    pub(crate) fn path(&self, name: &str) -> PathBuf {
         self.0.join(name)
     }
 }

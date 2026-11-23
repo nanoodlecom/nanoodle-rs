@@ -5,14 +5,15 @@
 //! a GLB with the node's fields: camera azimuth/elevation/distance, a
 //! clip plane (slice-3D), explode over the GLB's scene-graph parts, part
 //! isolation, animation stepping, turntable. The JS executor drives the
-//! scene over CDP; this twin uses Chromium's own headless screenshot with
-//! a virtual-time budget and the scene's auto mode (fields in the URL
+//! scene over CDP; this twin reads a completed canvas frame from Chromium
+//! using the scene's auto mode (fields in the URL
 //! fragment) — no new dependencies (the crate carries serde_json + ureq
 //! only). Chromium discovery mirrors the ffmpeg contract: NANOODLE_CHROME
 //! / CHROME_PATH, the Playwright browser cache, then PATH. Video mode
 //! assembles frames with ffmpeg, same as the other local nodes.
 
 use crate::{input_text, Ctx, NanoodleError, Node, NodeOutcome, Result};
+use crate::local_media::TempDir;
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -21,6 +22,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 const SCENE_HTML: &str = include_str!("render3d-assets/scene.html");
@@ -28,6 +30,8 @@ const THREE_JS: &[u8] = include_bytes!("render3d-assets/three.module.js");
 const GLTF_LOADER: &[u8] = include_bytes!("render3d-assets/addons/loaders/GLTFLoader.js");
 const ROOM_ENV: &[u8] = include_bytes!("render3d-assets/addons/environments/RoomEnvironment.js");
 const BG_UTILS: &[u8] = include_bytes!("render3d-assets/addons/utils/BufferGeometryUtils.js");
+const MAX_MODEL_BYTES: usize = 64 * 1024 * 1024;
+const RENDER_TIMEOUT: Duration = Duration::from_secs(120);
 
 fn err(msg: impl Into<String>) -> NanoodleError {
     NanoodleError(msg.into())
@@ -49,10 +53,10 @@ fn b64_encode(bytes: &[u8]) -> String {
 
 fn field_f64(node: &Node, key: &str, def: f64) -> f64 {
     match node.fields.get(key) {
-        Some(Value::Number(n)) => n.as_f64().unwrap_or(def),
-        Some(Value::String(s)) => s.parse::<f64>().unwrap_or(def),
-        _ => def,
-    }
+        Some(Value::Number(n)) => n.as_f64(),
+        Some(Value::String(s)) => s.trim().parse::<f64>().ok(),
+        _ => None,
+    }.filter(|n| n.is_finite()).unwrap_or(def)
 }
 
 fn field_str<'a>(node: &'a Node, key: &str) -> Option<String> {
@@ -70,8 +74,8 @@ pub fn scene_fields(node: &Node) -> Value {
     f.insert("azimuth".into(), json!(field_f64(node, "azimuth", 35.0)));
     f.insert("elevation".into(), json!(field_f64(node, "elevation", 18.0)));
     f.insert("distance".into(), json!(field_f64(node, "distance", 1.9)));
-    f.insert("width".into(), json!((field_f64(node, "width", 800.0) as i64).max(16)));
-    f.insert("height".into(), json!((field_f64(node, "height", 600.0) as i64).max(16)));
+    f.insert("width".into(), json!((field_f64(node, "width", 800.0).round() as i64).max(16)));
+    f.insert("height".into(), json!((field_f64(node, "height", 600.0).round() as i64).max(16)));
     f.insert("background".into(), json!(field_str(node, "background").filter(|s| !s.is_empty()).unwrap_or_else(|| "dark".to_string())));
     f.insert("explode".into(), json!(field_f64(node, "explode", 0.0)));
     if let Some(axis) = field_str(node, "clipAxis").filter(|s| !s.is_empty() && s != "none") {
@@ -120,10 +124,10 @@ pub fn find_chromium() -> Option<PathBuf> {
             }
         }
     }
-    if let Ok(path) = std::env::var("PATH") {
-        for dir in path.split(':') {
-            for name in ["chromium", "chromium-browser", "google-chrome", "google-chrome-stable"] {
-                let p = PathBuf::from(dir).join(name);
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            for name in ["chromium", "chromium-browser", "google-chrome", "google-chrome-stable", "chrome.exe"] {
+                let p = dir.join(name);
                 if p.exists() {
                     return Some(p);
                 }
@@ -139,27 +143,31 @@ fn no_chromium_error() -> NanoodleError {
 }
 
 /// Serve the scene assets + the GLB on 127.0.0.1 until `stop` is set.
-fn serve_scene(glb: Vec<u8>, stop: Arc<AtomicBool>) -> Result<u16> {
+fn serve_scene(glb: Vec<u8>, stop: Arc<AtomicBool>) -> Result<(u16, JoinHandle<()>)> {
     let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| err(format!("render3d: bind failed: {e}")))?;
     let port = listener.local_addr().map_err(|e| err(format!("render3d: {e}")))?.port();
-    listener.set_nonblocking(true).ok();
-    std::thread::spawn(move || {
+    listener.set_nonblocking(true).map_err(|e| err(format!("render3d: {e}")))?;
+    let worker = std::thread::spawn(move || {
         while !stop.load(Ordering::Relaxed) {
             match listener.accept() {
                 Ok((mut stream, _)) => {
+                    let timeout = Some(Duration::from_secs(2));
+                    let _ = stream.set_read_timeout(timeout);
+                    let _ = stream.set_write_timeout(timeout);
                     let mut buf = [0u8; 4096];
                     let n = stream.read(&mut buf).unwrap_or(0);
                     let req = String::from_utf8_lossy(&buf[..n]);
-                    let path = req.split_whitespace().nth(1).unwrap_or("/");
-                    let (ctype, body): (&str, &[u8]) = match path {
-                        "/model.glb" => ("model/gltf-binary", glb.as_slice()),
-                        "/three.module.js" => ("text/javascript", THREE_JS),
-                        "/addons/loaders/GLTFLoader.js" => ("text/javascript", GLTF_LOADER),
-                        "/addons/environments/RoomEnvironment.js" => ("text/javascript", ROOM_ENV),
-                        "/addons/utils/BufferGeometryUtils.js" => ("text/javascript", BG_UTILS),
-                        _ => ("text/html", SCENE_HTML.as_bytes()),
+                    let mut first_line = req.lines().next().unwrap_or_default().split_whitespace();
+                    let (status, ctype, body): (&str, &str, &[u8]) = match (first_line.next(), first_line.next()) {
+                        (Some("GET"), Some("/model.glb")) => ("200 OK", "model/gltf-binary", &glb),
+                        (Some("GET"), Some("/" | "/scene.html")) => ("200 OK", "text/html; charset=utf-8", SCENE_HTML.as_bytes()),
+                        (Some("GET"), Some("/three.module.js")) => ("200 OK", "text/javascript", THREE_JS),
+                        (Some("GET"), Some("/addons/loaders/GLTFLoader.js")) => ("200 OK", "text/javascript", GLTF_LOADER),
+                        (Some("GET"), Some("/addons/environments/RoomEnvironment.js")) => ("200 OK", "text/javascript", ROOM_ENV),
+                        (Some("GET"), Some("/addons/utils/BufferGeometryUtils.js")) => ("200 OK", "text/javascript", BG_UTILS),
+                        _ => ("404 Not Found", "text/plain", b""),
                     };
-                    let head = format!("HTTP/1.1 200 OK\r\ncontent-type: {ctype}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len());
+                    let head = format!("HTTP/1.1 {status}\r\ncontent-type: {ctype}\r\ncontent-length: {}\r\nx-content-type-options: nosniff\r\ncache-control: no-store\r\nconnection: close\r\n\r\n", body.len());
                     let _ = stream.write_all(head.as_bytes());
                     let _ = stream.write_all(body);
                     let _ = stream.flush();
@@ -171,7 +179,7 @@ fn serve_scene(glb: Vec<u8>, stop: Arc<AtomicBool>) -> Result<u16> {
             }
         }
     });
-    Ok(port)
+    Ok((port, worker))
 }
 
 fn percent_encode(s: &str) -> String {
@@ -185,56 +193,86 @@ fn percent_encode(s: &str) -> String {
     out
 }
 
-fn run_with_timeout(mut cmd: Command, timeout: Duration) -> Result<std::process::ExitStatus> {
-    let mut child = cmd.stdout(Stdio::null()).stderr(Stdio::null()).spawn()
-        .map_err(|e| err(format!("render3d: could not launch Chromium: {e}")))?;
-    let start = Instant::now();
+fn run_with_timeout(mut cmd: Command, deadline: Instant, program: &str) -> Result<std::process::ExitStatus> {
+    if Instant::now() >= deadline {
+        return Err(err("render3d exceeded the two-minute limit"));
+    }
+    let mut child = cmd.stderr(Stdio::null()).spawn()
+        .map_err(|e| err(format!("render3d: could not launch {program}: {e}")))?;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => return Ok(status),
             Ok(None) => {
-                if start.elapsed() > timeout {
+                if Instant::now() >= deadline {
                     let _ = child.kill();
-                    return Err(err("render3d: Chromium timed out"));
+                    let _ = child.wait();
+                    return Err(err("render3d exceeded the two-minute limit"));
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
-            Err(e) => return Err(err(format!("render3d: {e}"))),
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(err(format!("render3d: {e}")));
+            }
         }
     }
 }
 
-fn screenshot(exe: &PathBuf, port: u16, fields: &Value, out: &PathBuf) -> Result<()> {
-    let w = fields.get("width").and_then(|v| v.as_i64()).unwrap_or(800);
-    let h = fields.get("height").and_then(|v| v.as_i64()).unwrap_or(600);
+fn canvas_png(exe: &PathBuf, port: u16, fields: &Value, dom: &PathBuf, deadline: Instant) -> Result<Vec<u8>> {
     let frag = percent_encode(&fields.to_string());
     let url = format!("http://127.0.0.1:{port}/scene.html#f={frag}");
     let mut cmd = Command::new(exe);
     cmd.args([
-        "--headless", "--no-sandbox", "--use-angle=swiftshader", "--enable-unsafe-swiftshader",
-        "--hide-scrollbars", "--virtual-time-budget=20000",
-        &format!("--window-size={w},{h}"),
-        &format!("--screenshot={}", out.display()),
-        &url,
+        "--headless", "--no-sandbox", "--incognito", "--no-first-run", "--no-proxy-server", "--disable-background-networking",
+        "--use-angle=swiftshader", "--enable-unsafe-swiftshader", "--virtual-time-budget=20000", "--dump-dom",
     ]);
-    let status = run_with_timeout(cmd, Duration::from_secs(90))?;
-    if !status.success() || !out.exists() {
-        return Err(err("render3d: Chromium screenshot failed"));
+    let profile = dom.with_file_name("chrome-profile");
+    let mut profile_arg = std::ffi::OsString::from("--user-data-dir=");
+    profile_arg.push(profile);
+    cmd.arg(profile_arg).arg(url);
+    cmd.stdout(std::fs::File::create(dom).map_err(|e| err(format!("render3d: {e}")))?);
+    let status = run_with_timeout(cmd, deadline, "Chromium")?;
+    if !status.success() {
+        return Err(err("render3d: Chromium exited before producing a frame"));
     }
-    Ok(())
+    let mut html = String::new();
+    std::fs::File::open(dom).and_then(|f| f.take(32 * 1024 * 1024).read_to_string(&mut html))
+        .map_err(|e| err(format!("render3d: {e}")))?;
+    let (_, payload) = html.split_once("<meta name=\"render3d-png\" content=\"data:image/png;base64,")
+        .ok_or_else(|| err("render3d: scene did not produce a frame; the model must be renderable and self-contained"))?;
+    let (base64, _) = payload.split_once('"').ok_or_else(|| err("render3d: incomplete rendered frame"))?;
+    let png = decode_b64(base64)?;
+    let width = fields["width"].as_u64().unwrap_or_default() as u32;
+    let height = fields["height"].as_u64().unwrap_or_default() as u32;
+    if png.len() < 24 || !png.starts_with(b"\x89PNG\r\n\x1a\n") ||
+        png[16..20] != width.to_be_bytes() || png[20..24] != height.to_be_bytes() {
+        return Err(err("render3d: invalid rendered PNG or unexpected dimensions"));
+    }
+    Ok(png)
 }
 
 fn model_bytes(src: &str) -> Result<Vec<u8>> {
     if let Some(rest) = src.strip_prefix("data:") {
         let (meta, body) = rest.split_once(',').ok_or_else(|| err("render3d: malformed data: URL"))?;
-        if meta.contains(";base64") {
-            // Reuse the crate's decoder via audio's sibling in local_media style:
-            return decode_b64(body);
+        if body.len() > MAX_MODEL_BYTES.div_ceil(3) * 4 {
+            return Err(err("render3d model exceeds 64 MiB"));
         }
-        return Ok(body.as_bytes().to_vec());
+        if meta.contains(";base64") {
+            let bytes = decode_b64(body)?;
+            if bytes.len() <= MAX_MODEL_BYTES { return Ok(bytes); }
+        } else if body.len() <= MAX_MODEL_BYTES {
+            return Ok(body.as_bytes().to_vec());
+        }
+        return Err(err("render3d model exceeds 64 MiB"));
     }
-    let mut resp = ureq::get(src).call().map_err(|e| err(format!("render3d: could not download the model: {e}")))?;
-    let bytes = resp.body_mut().read_to_vec().map_err(|e| err(format!("render3d: could not read the model: {e}")))?;
+    if !src.starts_with("http://") && !src.starts_with("https://") {
+        return Err(err("render3d model must be a data: or HTTP(S) URL"));
+    }
+    let agent: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(RENDER_TIMEOUT)).build().into();
+    let mut resp = agent.get(src).call().map_err(|_| err("render3d: could not download the model"))?;
+    let bytes = resp.body_mut().with_config().limit(MAX_MODEL_BYTES as u64).read_to_vec()
+        .map_err(|_| err("render3d: could not read the model within the 64 MiB limit"))?;
     Ok(bytes)
 }
 
@@ -275,46 +313,51 @@ pub fn run_render3d(node: &Node, inputs: &HashMap<String, Value>, _ctx: &Ctx) ->
         Some(s) if !s.is_empty() => s,
         _ => return Err(err("render3d: connect a model first")),
     };
-    let exe = find_chromium().ok_or_else(no_chromium_error)?;
-    let glb = model_bytes(&src)?;
     let base = scene_fields(node);
+    let width = base["width"].as_u64().unwrap_or_default();
+    let height = base["height"].as_u64().unwrap_or_default();
+    if width > 2048 || height > 2048 {
+        return Err(err("render3d dimensions must be 16–2048 pixels"));
+    }
+    let video = if field_str(node, "mode").as_deref() == Some("video") {
+        let fps = field_f64(node, "fps", 24.0).round();
+        let duration = field_f64(node, "duration", 2.0);
+        let frames = ((fps * duration).round() as u64).max(2);
+        if !(1.0..=60.0).contains(&fps) || !(0.1..=10.0).contains(&duration) ||
+            frames > 240 || width * height * frames > 200_000_000 || width % 2 != 0 || height % 2 != 0 {
+            return Err(err("render3d video needs even dimensions, 1–60 fps, 0.1–10 seconds, at most 240 frames and 200 million pixels"));
+        }
+        Some((fps as u32, duration, frames))
+    } else { None };
+    let exe = find_chromium().ok_or_else(no_chromium_error)?;
+    let deadline = Instant::now() + RENDER_TIMEOUT;
+    let glb = model_bytes(&src)?;
     let stop = Arc::new(AtomicBool::new(false));
-    let port = serve_scene(glb, stop.clone())?;
-    let mode = field_str(node, "mode").unwrap_or_else(|| "image".to_string());
-    let result = render_with(node, &exe, port, &base, &mode);
+    let (port, worker) = serve_scene(glb, stop.clone())?;
+    let result = render_with(node, &exe, port, &base, video, deadline);
     stop.store(true, Ordering::Relaxed);
+    let _ = worker.join();
     let (port_name, data_url) = result?;
     let mut m = Map::new();
     m.insert(port_name.to_string(), json!(data_url));
     Ok(NodeOutcome::Done(m, Some(0.0)))
 }
 
-fn render_with(node: &Node, exe: &PathBuf, port: u16, base: &Value, mode: &str) -> Result<(&'static str, String)> {
-    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
-    let dir = std::env::temp_dir().join(format!("nanoodle-render3d-{}-{stamp}", std::process::id()));
-    std::fs::create_dir_all(&dir).map_err(|e| err(format!("render3d: {e}")))?;
-    let cleanup = |dir: &PathBuf| {
-        let _ = std::fs::remove_dir_all(dir);
+fn render_with(node: &Node, exe: &PathBuf, port: u16, base: &Value, video: Option<(u32, f64, u64)>, deadline: Instant) -> Result<(&'static str, String)> {
+    let dir = TempDir::new()?;
+    let dom = dir.path("render.html");
+    let Some((fps, duration, frames)) = video else {
+        let png = canvas_png(exe, port, base, &dom, deadline)?;
+        return Ok(("image", format!("data:image/png;base64,{}", b64_encode(&png))));
     };
-    if mode != "video" {
-        let out = dir.join("frame.png");
-        let r = screenshot(exe, port, base, &out)
-            .and_then(|_| std::fs::read(&out).map_err(|e| err(format!("render3d: {e}"))))
-            .map(|png| ("image", format!("data:image/png;base64,{}", b64_encode(&png))));
-        cleanup(&dir);
-        return r;
-    }
     // Video: sweep turntable / clip timeline / slice plane across frames.
-    let fps = field_f64(node, "fps", 24.0).max(1.0);
-    let duration = field_f64(node, "duration", 2.0).max(0.1);
-    let frames = ((fps * duration).round() as i64).max(2);
     let turntable = if node.fields.contains_key("turntable") { field_f64(node, "turntable", 360.0) } else { 360.0 };
     let has_clip_sweep = match node.fields.get("clipSweep") {
         Some(Value::Bool(b)) => *b,
         Some(Value::String(s)) => s == "true",
         _ => false,
     };
-    let has_anim = field_str(node, "animClip").map(|s| !s.is_empty()).unwrap_or(false);
+    let has_anim = base.get("animClip").is_some();
     let base_az = base.get("azimuth").and_then(|v| v.as_f64()).unwrap_or(35.0);
     for i in 0..frames {
         let t = i as f64 / (frames - 1) as f64;
@@ -329,29 +372,22 @@ fn render_with(node: &Node, exe: &PathBuf, port: u16, base: &Value, mode: &str) 
         if has_clip_sweep {
             obj.insert("clipPos".into(), json!(1.05 - 2.1 * t));
         }
-        let out = dir.join(format!("frame-{i:03}.png"));
-        if let Err(e) = screenshot(exe, port, &f, &out) {
-            cleanup(&dir);
-            return Err(e);
-        }
+        let png = canvas_png(exe, port, &f, &dom, deadline)?;
+        std::fs::write(dir.path(&format!("frame-{i:03}.png")), png)
+            .map_err(|e| err(format!("render3d: {e}")))?;
     }
-    let out_mp4 = dir.join("out.mp4");
-    let status = Command::new("ffmpeg")
-        .args(["-y", "-loglevel", "error", "-framerate", &format!("{fps}"), "-i",
-               &dir.join("frame-%03d.png").display().to_string(),
-               "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "20",
-               &out_mp4.display().to_string()])
-        .stdout(Stdio::null()).stderr(Stdio::null())
-        .status();
-    let r = match status {
-        Ok(s) if s.success() => std::fs::read(&out_mp4)
-            .map(|mp4| ("video", format!("data:video/mp4;base64,{}", b64_encode(&mp4))))
-            .map_err(|e| err(format!("render3d: {e}"))),
-        Ok(_) => Err(err("render3d: ffmpeg failed to assemble the video")),
-        Err(_) => Err(err("render3d video mode needs ffmpeg on PATH (not found). Install ffmpeg, or use image mode.")),
-    };
-    cleanup(&dir);
-    r
+    let out_mp4 = dir.path("out.mp4");
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args(["-y", "-loglevel", "error", "-framerate", &fps.to_string(), "-i"])
+        .arg(dir.path("frame-%03d.png"))
+        .args(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "20"])
+        .arg(&out_mp4)
+        .stdout(Stdio::null());
+    if !run_with_timeout(cmd, deadline, "ffmpeg")?.success() {
+        return Err(err("render3d: ffmpeg failed to assemble the video"));
+    }
+    let mp4 = std::fs::read(out_mp4).map_err(|e| err(format!("render3d: {e}")))?;
+    Ok(("video", format!("data:video/mp4;base64,{}", b64_encode(&mp4))))
 }
 
 #[cfg(test)]
@@ -383,6 +419,40 @@ mod tests {
         assert_eq!(b64_encode(b"fo"), "Zm8=");
         assert_eq!(b64_encode(b"foo"), "Zm9v");
         assert_eq!(decode_b64("Zm9v").unwrap(), b"foo");
+    }
+
+    #[test]
+    fn render_budgets_are_checked_before_loading_the_model() {
+        let ctx = Ctx::new("https://example.invalid", "fixture");
+        let input = HashMap::from([("model".into(), json!("https://example.invalid/model.glb"))]);
+        for (value, expected) in [
+            (json!({"width": 2049}), "dimensions"),
+            (json!({"mode": "video", "fps": 60, "duration": 10}), "240 frames"),
+            (json!({"mode": "video", "width": 319}), "even dimensions"),
+        ] {
+            let node = Node { id: "r".into(), ty: "render3d".into(), name: None, fields: value.as_object().unwrap().clone(), unknown: false };
+            let result = run_render3d(&node, &input, &ctx);
+            assert!(matches!(result, Err(e) if e.0.contains(expected)));
+        }
+    }
+
+    #[test]
+    fn chromium_refuses_a_frame_without_a_completed_canvas() {
+        if find_chromium().is_none() { return; }
+        let ctx = Ctx::new("https://example.invalid", "fixture");
+        let node = Node { id: "r".into(), ty: "render3d".into(), name: None, fields: Map::new(), unknown: false };
+        let bad = HashMap::from([("model".into(), json!("data:model/gltf-binary;base64,YmFk"))]);
+        assert!(matches!(run_render3d(&node, &bad, &ctx), Err(e) if e.0.contains("did not produce a frame")));
+        let asset = TcpListener::bind("127.0.0.1:0").unwrap();
+        asset.set_nonblocking(true).unwrap();
+        let glb = two_cube_glb();
+        let len = u32::from_le_bytes(glb[12..16].try_into().unwrap()) as usize;
+        let mut gltf: Value = serde_json::from_slice(&glb[20..20 + len]).unwrap();
+        gltf["buffers"][0]["uri"] = json!(format!("http://{}/model.bin", asset.local_addr().unwrap()));
+        let model = format!("data:model/gltf+json;base64,{}", b64_encode(gltf.to_string().as_bytes()));
+        let external = HashMap::from([("model".into(), json!(model))]);
+        assert!(matches!(run_render3d(&node, &external, &ctx), Err(e) if e.0.contains("self-contained")));
+        assert!(matches!(asset.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock));
     }
 
     /// The two-cube GLB from the JS suite (red cube + blue cube, two
