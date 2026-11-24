@@ -1,5 +1,5 @@
 use super::{materialize, poll_loop, run, run_node, Ctx, PollStep, RunResult};
-use serde_json::json;
+use serde_json::{json, Value};
 use std::{
     io::{self, BufRead, BufReader, Read, Write},
     net::TcpListener,
@@ -29,6 +29,10 @@ impl Reply {
 }
 
 fn with_provider(replies: Vec<Reply>, check: impl FnOnce(&Ctx)) -> Vec<String> {
+    with_provider_requests(replies, check).into_iter().map(|(route, _)| route).collect()
+}
+
+fn with_provider_requests(replies: Vec<Reply>, check: impl FnOnce(&Ctx)) -> Vec<(String, Vec<u8>)> {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let ctx = Ctx::new(
@@ -55,7 +59,7 @@ fn with_provider(replies: Vec<Reply>, check: impl FnOnce(&Ctx)) -> Vec<String> {
                 let mut reader = BufReader::new(&mut stream);
                 let mut request = String::new();
                 reader.read_line(&mut request).unwrap();
-                requests.push(request.split_whitespace().take(2).collect::<Vec<_>>().join(" "));
+                let route = request.split_whitespace().take(2).collect::<Vec<_>>().join(" ");
                 let mut length = 0;
                 loop {
                     let mut header = String::new();
@@ -69,7 +73,9 @@ fn with_provider(replies: Vec<Reply>, check: impl FnOnce(&Ctx)) -> Vec<String> {
                         }
                     }
                 }
-                io::copy(&mut reader.take(length), &mut io::sink()).unwrap();
+                let mut body = Vec::new();
+                reader.take(length).read_to_end(&mut body).unwrap();
+                requests.push((route, body));
                 write!(stream, "HTTP/1.1 {} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{}\r\n{}",
                     reply.status, reply.length.unwrap_or(reply.body.len()), reply.headers, reply.body).unwrap();
                 if reply.stall {
@@ -90,6 +96,39 @@ fn node_run(node_type: &str, ctx: &Ctx) -> std::result::Result<RunResult, super:
         "links": []
     })).unwrap();
     run(&graph, ctx)
+}
+
+#[test]
+fn custom_endpoint_prompt_can_be_supplied_by_a_text_wire() {
+    let reply = r#"{"choices":[{"message":{"content":"offline reply"}}]}"#;
+    for port in ["text", "prompt"] {
+        let requests = with_provider_requests(vec![Reply::json(200, reply)], |ctx| {
+            let graph = materialize(&json!({
+                "nodes":[
+                    {"id":"source","type":"text","fields":{"text":"wired request"}},
+                    {"id":"sink","type":"endpoint","fields":{"url":format!("{}/generate", ctx.base_url),"mode":"chat"}},
+                ],
+                "links":[{"from":{"node":"source","port":"text"},"to":{"node":"sink","port":port}}],
+            })).unwrap();
+            let result = run(&graph, ctx).unwrap_or_else(|error| panic!("{}", error.message));
+            assert_eq!(result.outputs["sink"], "offline reply");
+        });
+        let [(route, body)] = requests.as_slice() else {
+            panic!("expected one request, got {}", requests.len());
+        };
+        assert_eq!(route, "POST /generate");
+        let payload: Value = serde_json::from_slice(body).unwrap();
+        assert_eq!(payload["messages"][0], json!({"role":"user","content":"wired request"}));
+    }
+
+    let requests = with_provider(vec![Reply::json(200, reply)], |ctx| {
+        let graph = materialize(&json!({
+            "nodes":[{"id":"sink","type":"endpoint","fields":{"url":format!("{}/generate", ctx.base_url)}}],
+        })).unwrap();
+        let failure = run(&graph, ctx).unwrap_err();
+        assert!(failure.message.contains("missing required input"), "{}", failure.message);
+    });
+    assert!(requests.is_empty(), "{requests:?}");
 }
 
 #[test]
@@ -242,6 +281,65 @@ fn video_3d_and_lipsync_keep_submit_cost_when_poll_auth_is_rejected() {
                 "GET /api/video/status?requestId=job"
             ]
         );
+    }
+}
+
+#[test]
+fn lipsync_uses_the_catalog_to_choose_whether_to_send_a_portrait() {
+    let model = "fixture-avatar";
+    let audio = "https://fixture.invalid/line.wav";
+    let image = "https://fixture.invalid/portrait.png";
+    let mut data = json!({
+        "nodes": [
+            {"id":"audio","type":"aupload","fields":{"audio":audio}},
+            {"id":"avatar","type":"lipsync","fields":{"model":model}},
+        ],
+        "links":[{"from":{"node":"audio","port":"audio"},"to":{"node":"avatar","port":"audio"}}],
+    });
+    let audio_only = materialize(&data).unwrap();
+    data["nodes"].as_array_mut().unwrap().push(json!({"id":"image","type":"upload","fields":{"image":image}}));
+    data["links"].as_array_mut().unwrap().push(json!({
+        "from":{"node":"image","port":"image"},"to":{"node":"avatar","port":"image"},
+    }));
+    let with_portrait = materialize(&data).unwrap();
+
+    let preset = json!({"video":[{"id":model,"capabilities":{"image_to_video":false}}]});
+    let normalized = json!({"video":[{"id":model,"i2v":false}]});
+    let image_required = json!({"video":[{"id":model,"capabilities":{"image_to_video":true}}]});
+    for (graph, catalog, portrait) in [
+        (&audio_only, &preset, None),
+        (&with_portrait, &preset, None),
+        (&audio_only, &normalized, None),
+        (&with_portrait, &image_required, Some(image)),
+    ] {
+        let submit = Reply {
+            headers: "x-nanogpt-pricing: {\"costUsd\":0.4}\r\n",
+            ..Reply::json(200, r#"{"runId":"job"}"#)
+        };
+        let status = Reply::json(200, r#"{"status":"completed","output":{"url":"https://fixture.invalid/video.mp4"}}"#);
+        let requests = with_provider_requests(vec![submit, status], |ctx| {
+            let mut configured = Ctx::new(&ctx.base_url, &ctx.api_key);
+            configured.catalog = Some(catalog.clone());
+            let result = run(graph, &configured).unwrap_or_else(|error| panic!("{}", error.message));
+            assert_eq!(result.outputs["avatar"], "https://fixture.invalid/video.mp4");
+            assert_eq!(result.cost_usd, 0.4);
+        });
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].0, "POST /api/generate-video");
+        assert_eq!(requests[1].0, "GET /api/video/status?requestId=job");
+        let payload: Value = serde_json::from_slice(&requests[0].1).unwrap();
+        assert_eq!(payload["audioUrl"], audio);
+        assert_eq!(payload.get("imageDataUrl").and_then(Value::as_str), portrait);
+    }
+
+    for catalog in [None, Some(json!({"video":[]})), Some(image_required)] {
+        let requests = with_provider(vec![Reply::json(400, "unexpected request")], |ctx| {
+            let mut configured = Ctx::new(&ctx.base_url, &ctx.api_key);
+            configured.catalog = catalog;
+            let failure = run(&audio_only, &configured).unwrap_err();
+            assert_eq!(failure.result.unwrap().nodes["avatar"].error.as_deref(), Some("no image input"));
+        });
+        assert!(requests.is_empty(), "{requests:?}");
     }
 }
 

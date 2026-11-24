@@ -13,8 +13,8 @@
 //! through the API like their JS twins.
 
 use crate::{
-    input_text, mdl, multi_image_out, prompt_of, value_text, Ctx, NanoodleError, Node, NodeError,
-    NodeOutcome, NodeResult, PollStep, Result,
+    cat_item, input_text, mdl, model_of, multi_image_out, prompt_of, value_text, Ctx, NanoodleError,
+    Node, NodeError, NodeOutcome, NodeResult, PollStep, Result,
 };
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
@@ -3023,15 +3023,16 @@ pub fn run_vframes(node: &Node, inputs: &HashMap<String, Value>, _ctx: &Ctx) -> 
 }
 
 #[cfg(test)]
+fn has_ffmpeg() -> bool {
+    ["ffmpeg", "ffprobe"].iter().all(|bin| {
+        Command::new(bin).arg("-version").output().is_ok()
+    })
+}
+
+#[cfg(test)]
 mod vframes_tests {
     use super::*;
     use crate::{materialize, run};
-
-    fn has_ffmpeg() -> bool {
-        ["ffmpeg", "ffprobe"].iter().all(|bin| {
-            Command::new(bin).arg("-version").output().is_ok()
-        })
-    }
 
     #[test]
     fn video_frames_supply_high_numbered_saved_wires() {
@@ -3264,8 +3265,71 @@ pub fn run_extractaudio(node: &Node, inputs: &HashMap<String, Value>, _ctx: &Ctx
         Some(v) if v.is_finite() && v > 0.0 => v,
         _ => 0.0,
     };
-    let out = trim_audio_to_wav(&video, 0.0, length, 16000, true)?;
+    let out = trim_audio_to_wav(&video, field_start(node).max(0.0), length, 16000, true)?;
     Ok(single("audio", out, Some(0.0)))
+}
+
+#[cfg(test)]
+mod extractaudio_tests {
+    use super::*;
+    use crate::{materialize, run};
+
+    #[test]
+    fn extracts_audio_from_the_authored_or_wired_start() {
+        if !has_ffmpeg() {
+            return;
+        }
+
+        let dir = TempDir::new().unwrap();
+        let wav = dir.path("tones.wav");
+        let video = dir.path("tones.mp4");
+        let sample_rate = 16_000;
+        let samples: Vec<_> = (0..sample_rate * 2).map(|i| {
+            let frequency = if i < sample_rate { 300.0 } else { 900.0 };
+            (i as f32 / sample_rate as f32 * frequency * std::f32::consts::TAU).sin() * 0.4
+        }).collect();
+        std::fs::write(&wav, encode_wav_mono(&samples, sample_rate)).unwrap();
+        let encoded = Command::new("ffmpeg")
+            .args(["-loglevel", "error", "-f", "lavfi", "-i", "color=c=black:s=16x16:r=10:d=2", "-i"])
+            .arg(&wav)
+            .args(["-c:v", "mpeg4", "-c:a", "aac", "-threads", "1"])
+            .arg(&video).output().unwrap();
+        assert!(encoded.status.success(), "{}", String::from_utf8_lossy(&encoded.stderr));
+
+        let mut data = json!({
+            "nodes": [
+                {"id":"source","type":"vupload","fields":{"video":data_url_from_file(&video, Some("video/mp4")).unwrap()}},
+                {"id":"audio","type":"extractaudio","fields":{"length":0.25}},
+            ],
+            "links": [{"from":{"node":"source","port":"video"},"to":{"node":"audio","port":"video"}}],
+        });
+        let ctx = Ctx::new("", "");
+        for (start, wired, high_tone) in [(-0.25, false, false), (1.25, false, true), (0.0, true, true)] {
+            let mut input = data.clone();
+            input["nodes"][1]["fields"]["start"] = json!(start);
+            if wired {
+                input["nodes"].as_array_mut().unwrap().push(json!({
+                    "id":"offset","type":"text","fields":{"text":"1.25"},
+                }));
+                input["links"].as_array_mut().unwrap().push(json!({
+                    "from":{"node":"offset","port":"text"},"to":{"node":"audio","port":"start"},
+                }));
+            }
+            let graph = materialize(&input).unwrap();
+            let result = run(&graph, &ctx).unwrap_or_else(|error| panic!("{}", error.message));
+            let (bytes, _) = data_url_bytes(result.outputs["audio"].as_str().unwrap()).unwrap();
+            let audio = parse_pcm_wav(&bytes).unwrap();
+            assert_eq!(audio.sample_rate, sample_rate);
+            assert_eq!(audio.mono.len(), sample_rate as usize / 4);
+            let rises = audio.mono.windows(2).filter(|pair| pair[0] <= 0.0 && pair[1] > 0.0).count();
+            let expected = if high_tone { 200..245 } else { 60..90 };
+            assert!(expected.contains(&rises), "start={start}, wired={wired}: {rises} upcrossings");
+        }
+
+        data["nodes"][1]["fields"]["start"] = json!(3);
+        let failure = run(&materialize(&data).unwrap(), &ctx).unwrap_err();
+        assert!(failure.message.contains("past the end"), "{}", failure.message);
+    }
 }
 
 /// JS inpaint input resolution: wired value wins over the field unless null.
@@ -3307,11 +3371,17 @@ fn add_costs(a: Option<f64>, b: Option<f64>) -> Option<f64> {
 }
 
 pub fn run_lipsync(node: &Node, inputs: &HashMap<String, Value>, ctx: &Ctx) -> std::result::Result<NodeOutcome, NodeError> {
-    // No catalog access from Ctx: JS's avatarNeedsPortrait is true on a
-    // catalog miss, so the portrait requirement applies unconditionally here.
-    let image = match input_text(inputs, "image") {
-        Some(s) if !s.is_empty() => s,
-        _ => return Err(err("no image input").into()),
+    // Cataloged preset avatars take only audio. An unknown model retains the portrait requirement.
+    let requires_portrait = ctx.catalog.as_ref()
+        .and_then(|catalog| cat_item(catalog, "video", model_of(node).trim()))
+        .is_none_or(|model| {
+            model.pointer("/capabilities/image_to_video").and_then(Value::as_bool) == Some(true)
+                || model.get("i2v").and_then(Value::as_bool) == Some(true)
+        });
+    let image = if requires_portrait {
+        Some(input_text(inputs, "image").ok_or_else(|| err("no image input"))?)
+    } else {
+        None
     };
     let audio = match input_text(inputs, "audio") {
         Some(s) if !s.is_empty() => s,
@@ -3319,7 +3389,7 @@ pub fn run_lipsync(node: &Node, inputs: &HashMap<String, Value>, ctx: &Ctx) -> s
     };
     let prompt = prompt_of(node, inputs).map(|s| s.trim().to_string()).unwrap_or_default();
     let model = mdl(node)?;
-    let img = fit_image_inline(&image)?;
+    let img = image.as_deref().map(fit_image_inline).transpose()?;
     let extra = model_opts(node);
     let mut trim_sec: Option<f64> = None;
     // Every submit bills, including a failed attempt's (JS onCost per submit).
@@ -3344,7 +3414,7 @@ pub fn run_lipsync(node: &Node, inputs: &HashMap<String, Value>, ctx: &Ctx) -> s
         } else {
             AudioPart::DataUrl(audio.clone())
         };
-        match gen_video_local(ctx, &model, &prompt, Some(&img), &audio_part, &extra) {
+        match gen_video_local(ctx, &model, &prompt, img.as_deref(), &audio_part, &extra) {
             Ok((url, cost)) => return Ok(single("video", url, add_costs(spent, cost))),
             Err(e) => {
                 spent = add_costs(spent, e.cost);
