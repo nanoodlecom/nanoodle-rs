@@ -13,8 +13,8 @@
 //! through the API like their JS twins.
 
 use crate::{
-    input_text, mdl, multi_image_out, prompt_of, value_text, Ctx, NanoodleError, Node, NodeError,
-    NodeOutcome, NodeResult, PollStep, Result,
+    cat_item, input_text, mdl, model_of, multi_image_out, prompt_of, value_text, Ctx, NanoodleError,
+    Node, NodeError, NodeOutcome, NodeResult, PollStep, Result,
 };
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
@@ -3371,11 +3371,17 @@ fn add_costs(a: Option<f64>, b: Option<f64>) -> Option<f64> {
 }
 
 pub fn run_lipsync(node: &Node, inputs: &HashMap<String, Value>, ctx: &Ctx) -> std::result::Result<NodeOutcome, NodeError> {
-    // No catalog access from Ctx: JS's avatarNeedsPortrait is true on a
-    // catalog miss, so the portrait requirement applies unconditionally here.
-    let image = match input_text(inputs, "image") {
-        Some(s) if !s.is_empty() => s,
-        _ => return Err(err("no image input").into()),
+    // Cataloged preset avatars take only audio. An unknown model retains the portrait requirement.
+    let requires_portrait = ctx.catalog.as_ref()
+        .and_then(|catalog| cat_item(catalog, "video", model_of(node).trim()))
+        .is_none_or(|model| {
+            model.pointer("/capabilities/image_to_video").and_then(Value::as_bool) == Some(true)
+                || model.get("i2v").and_then(Value::as_bool) == Some(true)
+        });
+    let image = if requires_portrait {
+        Some(input_text(inputs, "image").ok_or_else(|| err("no image input"))?)
+    } else {
+        None
     };
     let audio = match input_text(inputs, "audio") {
         Some(s) if !s.is_empty() => s,
@@ -3383,7 +3389,7 @@ pub fn run_lipsync(node: &Node, inputs: &HashMap<String, Value>, ctx: &Ctx) -> s
     };
     let prompt = prompt_of(node, inputs).map(|s| s.trim().to_string()).unwrap_or_default();
     let model = mdl(node)?;
-    let img = fit_image_inline(&image)?;
+    let img = image.as_deref().map(fit_image_inline).transpose()?;
     let extra = model_opts(node);
     let mut trim_sec: Option<f64> = None;
     // Every submit bills, including a failed attempt's (JS onCost per submit).
@@ -3408,7 +3414,7 @@ pub fn run_lipsync(node: &Node, inputs: &HashMap<String, Value>, ctx: &Ctx) -> s
         } else {
             AudioPart::DataUrl(audio.clone())
         };
-        match gen_video_local(ctx, &model, &prompt, Some(&img), &audio_part, &extra) {
+        match gen_video_local(ctx, &model, &prompt, img.as_deref(), &audio_part, &extra) {
             Ok((url, cost)) => return Ok(single("video", url, add_costs(spent, cost))),
             Err(e) => {
                 spent = add_costs(spent, e.cost);
