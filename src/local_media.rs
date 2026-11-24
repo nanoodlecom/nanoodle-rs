@@ -3023,15 +3023,16 @@ pub fn run_vframes(node: &Node, inputs: &HashMap<String, Value>, _ctx: &Ctx) -> 
 }
 
 #[cfg(test)]
+fn has_ffmpeg() -> bool {
+    ["ffmpeg", "ffprobe"].iter().all(|bin| {
+        Command::new(bin).arg("-version").output().is_ok()
+    })
+}
+
+#[cfg(test)]
 mod vframes_tests {
     use super::*;
     use crate::{materialize, run};
-
-    fn has_ffmpeg() -> bool {
-        ["ffmpeg", "ffprobe"].iter().all(|bin| {
-            Command::new(bin).arg("-version").output().is_ok()
-        })
-    }
 
     #[test]
     fn video_frames_supply_high_numbered_saved_wires() {
@@ -3264,8 +3265,71 @@ pub fn run_extractaudio(node: &Node, inputs: &HashMap<String, Value>, _ctx: &Ctx
         Some(v) if v.is_finite() && v > 0.0 => v,
         _ => 0.0,
     };
-    let out = trim_audio_to_wav(&video, 0.0, length, 16000, true)?;
+    let out = trim_audio_to_wav(&video, field_start(node).max(0.0), length, 16000, true)?;
     Ok(single("audio", out, Some(0.0)))
+}
+
+#[cfg(test)]
+mod extractaudio_tests {
+    use super::*;
+    use crate::{materialize, run};
+
+    #[test]
+    fn extracts_audio_from_the_authored_or_wired_start() {
+        if !has_ffmpeg() {
+            return;
+        }
+
+        let dir = TempDir::new().unwrap();
+        let wav = dir.path("tones.wav");
+        let video = dir.path("tones.mp4");
+        let sample_rate = 16_000;
+        let samples: Vec<_> = (0..sample_rate * 2).map(|i| {
+            let frequency = if i < sample_rate { 300.0 } else { 900.0 };
+            (i as f32 / sample_rate as f32 * frequency * std::f32::consts::TAU).sin() * 0.4
+        }).collect();
+        std::fs::write(&wav, encode_wav_mono(&samples, sample_rate)).unwrap();
+        let encoded = Command::new("ffmpeg")
+            .args(["-loglevel", "error", "-f", "lavfi", "-i", "color=c=black:s=16x16:r=10:d=2", "-i"])
+            .arg(&wav)
+            .args(["-c:v", "mpeg4", "-c:a", "aac", "-threads", "1"])
+            .arg(&video).output().unwrap();
+        assert!(encoded.status.success(), "{}", String::from_utf8_lossy(&encoded.stderr));
+
+        let mut data = json!({
+            "nodes": [
+                {"id":"source","type":"vupload","fields":{"video":data_url_from_file(&video, Some("video/mp4")).unwrap()}},
+                {"id":"audio","type":"extractaudio","fields":{"length":0.25}},
+            ],
+            "links": [{"from":{"node":"source","port":"video"},"to":{"node":"audio","port":"video"}}],
+        });
+        let ctx = Ctx::new("", "");
+        for (start, wired, high_tone) in [(-0.25, false, false), (1.25, false, true), (0.0, true, true)] {
+            let mut input = data.clone();
+            input["nodes"][1]["fields"]["start"] = json!(start);
+            if wired {
+                input["nodes"].as_array_mut().unwrap().push(json!({
+                    "id":"offset","type":"text","fields":{"text":"1.25"},
+                }));
+                input["links"].as_array_mut().unwrap().push(json!({
+                    "from":{"node":"offset","port":"text"},"to":{"node":"audio","port":"start"},
+                }));
+            }
+            let graph = materialize(&input).unwrap();
+            let result = run(&graph, &ctx).unwrap_or_else(|error| panic!("{}", error.message));
+            let (bytes, _) = data_url_bytes(result.outputs["audio"].as_str().unwrap()).unwrap();
+            let audio = parse_pcm_wav(&bytes).unwrap();
+            assert_eq!(audio.sample_rate, sample_rate);
+            assert_eq!(audio.mono.len(), sample_rate as usize / 4);
+            let rises = audio.mono.windows(2).filter(|pair| pair[0] <= 0.0 && pair[1] > 0.0).count();
+            let expected = if high_tone { 200..245 } else { 60..90 };
+            assert!(expected.contains(&rises), "start={start}, wired={wired}: {rises} upcrossings");
+        }
+
+        data["nodes"][1]["fields"]["start"] = json!(3);
+        let failure = run(&materialize(&data).unwrap(), &ctx).unwrap_err();
+        assert!(failure.message.contains("past the end"), "{}", failure.message);
+    }
 }
 
 /// JS inpaint input resolution: wired value wins over the field unless null.
