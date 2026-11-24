@@ -2113,7 +2113,9 @@ fn derive_inputs(graph: &Graph) -> Vec<InputEntry> {
             continue;
         }
         for (field, label, optional, spec_def) in input_specs(&n.ty) {
-            if !fed(&n.id, field) {
+            let wired = fed(&n.id, field)
+                || (n.ty == "endpoint" && *field == "prompt" && fed(&n.id, "text"));
+            if !wired {
                 mk(&mut raw, n, field, label, *optional, *spec_def);
             }
         }

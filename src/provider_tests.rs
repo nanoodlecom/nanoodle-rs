@@ -99,6 +99,39 @@ fn node_run(node_type: &str, ctx: &Ctx) -> std::result::Result<RunResult, super:
 }
 
 #[test]
+fn custom_endpoint_prompt_can_be_supplied_by_a_text_wire() {
+    let reply = r#"{"choices":[{"message":{"content":"offline reply"}}]}"#;
+    for port in ["text", "prompt"] {
+        let requests = with_provider_requests(vec![Reply::json(200, reply)], |ctx| {
+            let graph = materialize(&json!({
+                "nodes":[
+                    {"id":"source","type":"text","fields":{"text":"wired request"}},
+                    {"id":"sink","type":"endpoint","fields":{"url":format!("{}/generate", ctx.base_url),"mode":"chat"}},
+                ],
+                "links":[{"from":{"node":"source","port":"text"},"to":{"node":"sink","port":port}}],
+            })).unwrap();
+            let result = run(&graph, ctx).unwrap_or_else(|error| panic!("{}", error.message));
+            assert_eq!(result.outputs["sink"], "offline reply");
+        });
+        let [(route, body)] = requests.as_slice() else {
+            panic!("expected one request, got {}", requests.len());
+        };
+        assert_eq!(route, "POST /generate");
+        let payload: Value = serde_json::from_slice(body).unwrap();
+        assert_eq!(payload["messages"][0], json!({"role":"user","content":"wired request"}));
+    }
+
+    let requests = with_provider(vec![Reply::json(200, reply)], |ctx| {
+        let graph = materialize(&json!({
+            "nodes":[{"id":"sink","type":"endpoint","fields":{"url":format!("{}/generate", ctx.base_url)}}],
+        })).unwrap();
+        let failure = run(&graph, ctx).unwrap_err();
+        assert!(failure.message.contains("missing required input"), "{}", failure.message);
+    });
+    assert!(requests.is_empty(), "{requests:?}");
+}
+
+#[test]
 fn provider_errors_retain_known_cost_without_billing_rejected_requests() {
     let pricing = "x-nanogpt-pricing: {\"costUsd\":0.21}\r\n";
     let cases = [
