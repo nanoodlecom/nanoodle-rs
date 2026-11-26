@@ -1547,7 +1547,7 @@ fn trim_audio_to_wav_ffmpeg(
     let dir = TempDir::new()?;
     let in_path = write_input(&dir, "in", url)?;
     let dur = probe_duration(&in_path);
-    let s = if start == 0.0 || start.is_nan() { 0.0 } else { start };
+    let s = start.max(0.0);
     if let Some(d) = dur {
         if s >= d {
             return Err(past_end_error(s, d));
@@ -3270,9 +3270,56 @@ pub fn run_extractaudio(node: &Node, inputs: &HashMap<String, Value>, _ctx: &Ctx
 }
 
 #[cfg(test)]
-mod extractaudio_tests {
+mod audio_trim_tests {
     use super::*;
     use crate::{materialize, run};
+
+    #[test]
+    fn trims_compressed_audio_from_zero_for_negative_starts() {
+        if !has_ffmpeg() {
+            return;
+        }
+
+        let dir = TempDir::new().unwrap();
+        let clip = dir.path("tone.m4a");
+        let encoded = Command::new("ffmpeg")
+            .args(["-loglevel", "error", "-f", "lavfi", "-i", "sine=frequency=330:sample_rate=16000:duration=2", "-c:a", "aac"])
+            .arg(&clip).output().unwrap();
+        assert!(encoded.status.success(), "{}", String::from_utf8_lossy(&encoded.stderr));
+
+        let mut data = json!({
+            "nodes": [
+                {"id":"source","type":"aupload","fields":{"audio":data_url_from_file(&clip, Some("audio/mp4")).unwrap()}},
+                {"id":"trim","type":"trim","fields":{"start":0,"length":0.25}},
+            ],
+            "links": [{"from":{"node":"source","port":"audio"},"to":{"node":"trim","port":"audio"}}],
+        });
+        let ctx = Ctx::new("", "");
+        let samples = |data: &Value| {
+            let graph = materialize(data).unwrap();
+            let result = run(&graph, &ctx).unwrap_or_else(|error| panic!("{}", error.message));
+            let (bytes, _) = data_url_bytes(result.outputs["trim"].as_str().unwrap()).unwrap();
+            parse_pcm_wav(&bytes).unwrap().mono
+        };
+        let expected = samples(&data);
+        assert_eq!(expected.len(), 4_000);
+
+        data["nodes"][1]["fields"]["start"] = json!(-0.25);
+        let authored = samples(&data);
+        assert_eq!(authored.len(), expected.len(), "authored negative start");
+        assert_eq!(authored, expected);
+
+        data["nodes"][1]["fields"]["start"] = json!(0.5);
+        data["nodes"].as_array_mut().unwrap().push(json!({
+            "id":"offset","type":"text","fields":{"text":"-0.25"},
+        }));
+        data["links"].as_array_mut().unwrap().push(json!({
+            "from":{"node":"offset","port":"text"},"to":{"node":"trim","port":"start"},
+        }));
+        let wired = samples(&data);
+        assert_eq!(wired.len(), expected.len(), "wired negative start");
+        assert_eq!(wired, expected);
+    }
 
     #[test]
     fn extracts_audio_from_the_authored_or_wired_start() {
