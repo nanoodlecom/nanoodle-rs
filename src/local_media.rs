@@ -1880,11 +1880,9 @@ fn mux_soundtrack(video_url: &str, audio_url: &str, loop_audio: bool) -> Result<
             args.extend(["-c:v".into(), "copy".into()]);
         }
         args.extend(["-c:a".into(), "aac".into(), "-b:a".into(), "128k".into()]);
-        if loop_audio {
-            if let Some(d) = vdur {
-                args.push("-t".into());
-                args.push(js_num(d));
-            }
+        if let (true, Some(duration)) = (loop_audio, vdur) {
+            args.push("-t".into());
+            args.push(js_num(duration));
         } else {
             args.push("-shortest".into());
         }
@@ -3245,6 +3243,61 @@ pub fn run_soundtrack(node: &Node, inputs: &HashMap<String, Value>, _ctx: &Ctx) 
     };
     let out = mux_soundtrack(&video, &audio, loop_audio)?;
     Ok(single("video", out, Some(0.0)))
+}
+
+#[cfg(test)]
+mod soundtrack_tests {
+    use super::*;
+    use crate::{materialize, run};
+
+    #[test]
+    fn looping_soundtrack_ends_with_video_that_has_no_duration_metadata() {
+        if !has_ffmpeg() {
+            return;
+        }
+
+        let dir = TempDir::new().unwrap();
+        // Writing Matroska to a pipe leaves the duration unset in its header.
+        let video = Command::new("ffmpeg")
+            .args([
+                "-loglevel", "error", "-f", "lavfi", "-i", "color=c=black:s=32x32:r=10:d=0.8",
+                "-c:v", "mpeg4", "-threads", "1", "-f", "matroska", "pipe:1",
+            ])
+            .output().unwrap();
+        assert!(video.status.success(), "{}", String::from_utf8_lossy(&video.stderr));
+        let source = dir.path("stream.mkv");
+        std::fs::write(&source, &video.stdout).unwrap();
+        assert_eq!(probe_duration(&source), None);
+
+        let sample_rate = 16_000;
+        let tone: Vec<_> = (0..sample_rate / 4).map(|i| {
+            (i as f32 * 330.0 * std::f32::consts::TAU / sample_rate as f32).sin() * 0.4
+        }).collect();
+        let audio = encode_wav_mono(&tone, sample_rate);
+        let graph = materialize(&json!({
+            "nodes": [
+                {"id":"clip","type":"vupload","fields":{"video":bytes_to_data_url(&video.stdout, Some("video/x-matroska"))}},
+                {"id":"tone","type":"aupload","fields":{"audio":bytes_to_data_url(&audio, Some("audio/wav"))}},
+                {"id":"mux","type":"soundtrack","fields":{"loop":true}},
+            ],
+            "links": [
+                {"from":{"node":"clip","port":"video"},"to":{"node":"mux","port":"video"}},
+                {"from":{"node":"tone","port":"audio"},"to":{"node":"mux","port":"audio"}},
+            ],
+        })).unwrap();
+        let result = run(&graph, &Ctx::new("", "")).unwrap_or_else(|error| panic!("{}", error.message));
+        let (bytes, _) = data_url_bytes(result.outputs["mux"].as_str().unwrap()).unwrap();
+        let output = dir.path("soundtrack.mp4");
+        std::fs::write(&output, bytes).unwrap();
+        assert_eq!(probe_duration(&output), Some(0.8));
+        let audio_duration = run_proc("ffprobe", &[
+            "-v".into(), "error".into(), "-select_streams".into(), "a:0".into(),
+            "-show_entries".into(), "stream=duration".into(), "-of".into(), "csv=p=0".into(),
+            output.to_string_lossy().into_owned(),
+        ]).unwrap();
+        let audio_seconds: f64 = audio_duration.trim().parse().unwrap();
+        assert!((0.6..=0.8).contains(&audio_seconds), "audio duration: {audio_seconds}");
+    }
 }
 
 pub fn run_trim(node: &Node, inputs: &HashMap<String, Value>, _ctx: &Ctx) -> Result<NodeOutcome> {
