@@ -348,8 +348,12 @@ impl Drop for TempDir {
 /// sniffed mime for data: URLs, URL path extension for http(s).
 fn write_input(dir: &TempDir, name: &str, url: &str) -> Result<PathBuf> {
     let bytes = url_bytes(url)?;
+    write_input_bytes(dir, name, url, &bytes)
+}
+
+fn write_input_bytes(dir: &TempDir, name: &str, url: &str, bytes: &[u8]) -> Result<PathBuf> {
     let ext: String = if url.to_ascii_lowercase().starts_with("data:") {
-        let mime = sniff_mime(&bytes);
+        let mime = sniff_mime(bytes);
         if mime.contains("png") {
             ".png".to_string()
         } else if mime.contains("jpeg") {
@@ -373,7 +377,7 @@ fn write_input(dir: &TempDir, name: &str, url: &str) -> Result<PathBuf> {
         url_ext(url).unwrap_or_else(|| ".bin".to_string())
     };
     let path = dir.path(&format!("{}{}", name, ext));
-    std::fs::write(&path, &bytes).map_err(|e| err(format!("couldn't write temp file: {}", e)))?;
+    std::fs::write(&path, bytes).map_err(|e| err(format!("couldn't write temp file: {}", e)))?;
     Ok(path)
 }
 
@@ -1539,13 +1543,14 @@ fn probe_duration(path: &PathBuf) -> Option<f64> {
 /// trimAudioToWavFfmpeg mirror.
 fn trim_audio_to_wav_ffmpeg(
     url: &str,
+    bytes: &[u8],
     start: f64,
     length: f64,
     target_rate: u32,
     whole_if_blank: bool,
 ) -> Result<String> {
     let dir = TempDir::new()?;
-    let in_path = write_input(&dir, "in", url)?;
+    let in_path = write_input_bytes(&dir, "in", url, bytes)?;
     let dur = probe_duration(&in_path);
     let s = start.max(0.0);
     if let Some(d) = dur {
@@ -1616,7 +1621,7 @@ fn trim_audio_to_wav(url: &str, start: f64, length: f64, target_rate: u32, whole
             }
         }
     }
-    trim_audio_to_wav_ffmpeg(url, start, length, target_rate, whole_if_blank)
+    trim_audio_to_wav_ffmpeg(url, &bytes, start, length, target_rate, whole_if_blank)
 }
 
 // ---------------------------------------------------------------- vframes
@@ -3273,6 +3278,17 @@ pub fn run_extractaudio(node: &Node, inputs: &HashMap<String, Value>, _ctx: &Ctx
 mod audio_trim_tests {
     use super::*;
     use crate::{materialize, run};
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+
+    fn aac_tone(dir: &TempDir) -> PathBuf {
+        let clip = dir.path("tone.m4a");
+        let encoded = Command::new("ffmpeg")
+            .args(["-loglevel", "error", "-f", "lavfi", "-i", "sine=frequency=330:sample_rate=16000:duration=2", "-c:a", "aac"])
+            .arg(&clip).output().unwrap();
+        assert!(encoded.status.success(), "{}", String::from_utf8_lossy(&encoded.stderr));
+        clip
+    }
 
     #[test]
     fn trims_compressed_audio_from_zero_for_negative_starts() {
@@ -3281,12 +3297,7 @@ mod audio_trim_tests {
         }
 
         let dir = TempDir::new().unwrap();
-        let clip = dir.path("tone.m4a");
-        let encoded = Command::new("ffmpeg")
-            .args(["-loglevel", "error", "-f", "lavfi", "-i", "sine=frequency=330:sample_rate=16000:duration=2", "-c:a", "aac"])
-            .arg(&clip).output().unwrap();
-        assert!(encoded.status.success(), "{}", String::from_utf8_lossy(&encoded.stderr));
-
+        let clip = aac_tone(&dir);
         let mut data = json!({
             "nodes": [
                 {"id":"source","type":"aupload","fields":{"audio":data_url_from_file(&clip, Some("audio/mp4")).unwrap()}},
@@ -3319,6 +3330,48 @@ mod audio_trim_tests {
         let wired = samples(&data);
         assert_eq!(wired.len(), expected.len(), "wired negative start");
         assert_eq!(wired, expected);
+    }
+
+    #[test]
+    fn trims_compressed_audio_from_a_one_use_url() {
+        if !has_ffmpeg() {
+            return;
+        }
+
+        let dir = TempDir::new().unwrap();
+        let bytes = std::fs::read(aac_tone(&dir)).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/tone.m4a", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            drop(listener);
+            stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let mut reader = BufReader::new(&mut stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert!(line.starts_with("GET /tone.m4a "), "{line}");
+            loop {
+                line.clear();
+                if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                    break;
+                }
+            }
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: audio/mp4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", bytes.len()).unwrap();
+            stream.write_all(&bytes).unwrap();
+        });
+
+        let data = json!({
+            "nodes": [
+                {"id":"source","type":"aupload","fields":{"audio":url}},
+                {"id":"trim","type":"trim","fields":{"length":0.25}},
+            ],
+            "links": [{"from":{"node":"source","port":"audio"},"to":{"node":"trim","port":"audio"}}],
+        });
+        let graph = materialize(&data).unwrap();
+        let result = run(&graph, &Ctx::new("", "")).unwrap_or_else(|error| panic!("{}", error.message));
+        server.join().unwrap();
+        let (bytes, _) = data_url_bytes(result.outputs["trim"].as_str().unwrap()).unwrap();
+        assert_eq!(parse_pcm_wav(&bytes).unwrap().mono.len(), 4_000);
     }
 
     #[test]
